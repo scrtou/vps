@@ -1,11 +1,14 @@
 #!/bin/bash
 
 # =================================================================
-#            VPS 高级管理脚本 v2.3
+#                         VPS 高级管理脚本 v2.4
 #
 #   作者: Gemini & User
 #   更新日期: 2025-09-07
 #
+#   v2.4 更新日志:
+#   - [新增] 脚本启动时自动检测并尝试安装 'sudo' (适用于 apt/yum/dnf)。
+#   - [新增] 增加 "禁止 root 用户 SSH 登录" 功能，操作前会进行安全检查。
 #   v2.3 更新日志:
 #   - [修复] 为端口转发功能增加了严格的输入验证，防止端口号为空。
 #   - [修复] 为iptables命令增加了执行结果检查，失败时会报错并中止。
@@ -29,6 +32,7 @@ check_root() {
         exit 1
     fi
 }
+
 confirm() {
     read -r -p "$1 [y/N] " response
     case "$response" in
@@ -36,6 +40,29 @@ confirm() {
         *) false ;;
     esac
 }
+
+check_and_install_sudo() {
+    if ! command -v sudo &> /dev/null; then
+        echo -e "${YELLOW}检测到 'sudo' 命令未安装，正在尝试自动安装...${NC}"
+        if command -v apt-get &> /dev/null; then
+            apt-get update && apt-get install -y sudo
+        elif command -v dnf &> /dev/null; then
+            dnf install -y sudo
+        elif command -v yum &> /dev/null; then
+            yum install -y sudo
+        else
+            echo -e "${RED}错误：无法确定包管理器。请手动安装 'sudo'。${NC}"
+            exit 1
+        fi
+        if ! command -v sudo &> /dev/null; then
+             echo -e "${RED}错误：'sudo' 安装失败。请手动安装后重试。${NC}"
+             exit 1
+        else
+             echo -e "${GREEN}'sudo' 安装成功。${NC}"
+        fi
+    fi
+}
+
 
 # --- SSH 管理 ---
 change_ssh_port() {
@@ -85,6 +112,61 @@ change_ssh_port() {
     if systemctl restart "$ssh_service_name"; then
         echo -e "${GREEN}SSH端口已成功修改为: $new_port${NC}"
         echo -e "${YELLOW}警告：请确保防火墙已正确开放新端口，并使用新端口重新连接！${NC}"
+    else
+        echo -e "${RED}错误：重启 $ssh_service_name 服务失败！${NC}"
+    fi
+}
+
+disable_root_login() {
+    echo -e "${BLUE}--- 禁止 root 用户 SSH 登录 ---${NC}"
+    echo -e "${YELLOW}安全警告：此操作将禁止 root 用户直接通过 SSH 登录。${NC}"
+    echo -e "${YELLOW}在继续之前，请务必确认存在一个拥有 sudo 权限的普通用户。${NC}"
+
+    local sudo_users
+    sudo_users=$(getent group sudo | cut -d: -f4)
+    local wheel_users
+    wheel_users=$(getent group wheel | cut -d: -f4)
+
+    if [ -z "$sudo_users" ] && [ -z "$wheel_users" ]; then
+        echo -e "${RED}错误：系统中没有找到任何 sudo 或 wheel 组的用户。${NC}"
+        echo -e "${YELLOW}为了您的服务器安全，操作已中止。请先使用“用户管理”菜单创建一个拥有 sudo 权限的用户。${NC}"
+        return 1
+    else
+        echo -e "${GREEN}检测到以下用户拥有sudo权限:${NC}"
+        echo "$sudo_users$wheel_users" | tr ',' '\n' | sed '/^$/d' | sort -u
+    fi
+
+    if ! confirm "您确定要继续吗？"; then
+        echo "操作已取消。"
+        return
+    fi
+    
+    backup_file="${SSHD_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$SSHD_CONFIG" "$backup_file"
+    echo "配置文件已备份至 $backup_file"
+
+    if grep -q -E "^#?PermitRootLogin" "$SSHD_CONFIG"; then
+        sed -i -E 's/^#?PermitRootLogin.*/PermitRootLogin no/' "$SSHD_CONFIG"
+    else
+        echo "PermitRootLogin no" >> "$SSHD_CONFIG"
+    fi
+    
+    echo -e "${YELLOW}正在测试SSH配置...${NC}"
+    sshd -t
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}错误：SSH配置文件测试失败！操作已自动回滚。${NC}"
+        mv "$backup_file" "$SSHD_CONFIG"
+        return 1
+    fi
+
+    local ssh_service_name="sshd"
+    if systemctl list-units --type=service | grep -q "ssh.service"; then
+        ssh_service_name="ssh"
+    fi
+    echo "正在重启 $ssh_service_name 服务..."
+    if systemctl restart "$ssh_service_name"; then
+        echo -e "${GREEN}成功禁止 root 用户 SSH 登录。${NC}"
+        echo -e "${YELLOW}请使用普通用户重新连接，然后使用 'sudo -i'切换到 root。${NC}"
     else
         echo -e "${RED}错误：重启 $ssh_service_name 服务失败！${NC}"
     fi
@@ -391,33 +473,37 @@ view_port_forwarding() {
 # --- 主程序 ---
 main() {
     check_root
+    check_and_install_sudo
     while true; do
         firewall_type=$(detect_firewall)
         clear
         echo "========================================="
-        echo "         VPS 高级管理脚本 v2.3           "
+        echo "         VPS 高级管理脚本 v2.4           "
         echo "========================================="
         echo " 1. 修改SSH端口"
-        echo " 2. 用户管理"
-        echo " 3. 启用并初始化iptables防火墙"
-        echo " 4. 配置防火墙端口 (当前: $firewall_type)"
-        echo " 5. 查看当前防火墙规则 (当前: $firewall_type)"
-        echo " 6. 端口转发管理 (iptables)"
+        echo " 2. 禁止 root 用户 SSH 登录"
+        echo " 3. 用户管理"
+        echo " 4. 启用并初始化iptables防火墙"
+        echo " 5. 配置防火墙端口 (当前: $firewall_type)"
+        echo " 6. 查看当前防火墙规则 (当前: $firewall_type)"
+        echo " 7. 端口转发管理 (iptables)"
         echo " 0. 退出"
         echo "========================================="
         read -p "请选择功能: " choice
         case $choice in
             1) change_ssh_port ;;
-            2) user_management ;;
-            3) if confirm "${YELLOW}此操作将清空现有规则并设置安全默认值，确定吗？${NC}"; then enable_iptables; else echo "操作已取消。"; fi ;;
-            4) configure_ports ;;
-            5) show_firewall_rules ;;
-            6) port_forwarding_menu ;;
+            2) disable_root_login ;;
+            3) user_management ;;
+            4) if confirm "${YELLOW}此操作将清空现有规则并设置安全默认值，确定吗？${NC}"; then enable_iptables; else echo "操作已取消。"; fi ;;
+            5) configure_ports ;;
+            6) show_firewall_rules ;;
+            7) port_forwarding_menu ;;
             0) echo "退出脚本"; exit 0 ;;
             *) echo -e "${RED}无效的选择，请重试${NC}"; sleep 2 ;;
         esac
-        if [[ "$choice" -ne 2 && "$choice" -ne 6 && "$choice" -ne 0 ]]; then
-             read -p $'\n按Enter键返回主菜单...'
+        # 对于没有子菜单的选项，暂停等待用户确认
+        if [[ "$choice" -ne 3 && "$choice" -ne 7 && "$choice" -ne 0 ]]; then
+              read -p $'\n按Enter键返回主菜单...'
         fi
     done
 }
