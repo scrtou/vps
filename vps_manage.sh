@@ -1,18 +1,16 @@
 #!/bin/bash
 
 # =================================================================
-#                         VPS 高级管理脚本 v2.4
+#                         VPS 高级管理脚本 v2.5
 #
 #   作者: Gemini & User
-#   更新日期: 2025-09-07
+#   更新日期: 2025-09-15
 #
+#   v2.5 更新日志:
+#   - [新增] 在Debian/Ubuntu系统上，当iptables规则无法保存时，会提示并自动安装 iptables-persistent。
 #   v2.4 更新日志:
 #   - [新增] 脚本启动时自动检测并尝试安装 'sudo' (适用于 apt/yum/dnf)。
 #   - [新增] 增加 "禁止 root 用户 SSH 登录" 功能，操作前会进行安全检查。
-#   v2.3 更新日志:
-#   - [修复] 为端口转发功能增加了严格的输入验证，防止端口号为空。
-#   - [修复] 为iptables命令增加了执行结果检查，失败时会报错并中止。
-#   - [修复] 优化了iptables规则的保存逻辑，根据系统类型智能选择路径。
 # =================================================================
 
 # --- 全局变量和颜色定义 ---
@@ -338,7 +336,6 @@ configure_ports() {
             echo -e "${GREEN}iptables/ip6tables: 已${op_text} UDP 端口 $port${NC}"
         fi
         save_iptables_rules
-        echo "Iptables 规则已保存。"
     elif [[ "$firewall" == "firewalld" ]]; then
         echo "firewalld 操作暂未实现"
     fi
@@ -348,9 +345,26 @@ save_iptables_rules() {
         if [ -d /etc/iptables ]; then
             iptables-save > /etc/iptables/rules.v4
             ip6tables-save > /etc/iptables/rules.v6
+            echo "iptables 规则已保存。"
         elif [ -d /etc/sysconfig ]; then
             iptables-save > /etc/sysconfig/iptables
             ip6tables-save > /etc/sysconfig/ip6tables
+            echo "iptables 规则已保存。"
+        elif command -v apt-get &> /dev/null; then
+            echo -e "${YELLOW}为了在重启后保留防火墙规则，需要安装 'iptables-persistent' 包。${NC}"
+            if confirm "是否现在自动安装 'iptables-persistent'？"; then
+                echo "正在运行 apt-get update..."
+                apt-get update >/dev/null 2>&1
+                echo "正在安装 iptables-persistent (此过程将自动保存当前规则)..."
+                DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent >/dev/null 2>&1
+                if [ $? -eq 0 ] && [ -d /etc/iptables ]; then
+                   echo -e "${GREEN}安装成功，iptables 规则已自动保存。${NC}"
+                else
+                   echo -e "${RED}错误：iptables-persistent 安装失败。规则可能不会在重启后保留。${NC}"
+                fi
+            else
+                echo -e "${YELLOW}操作已取消。警告: 规则可能不会在重启后保留。${NC}"
+            fi
         else
             echo -e "${YELLOW}警告: 未找到标准的iptables规则保存路径。规则可能不会在重启后保留。${NC}"
         fi
@@ -448,7 +462,7 @@ add_port_forwarding() {
     fi
 
     save_iptables_rules
-    echo -e "${GREEN}成功添加并保存端口转发规则: $sport -> $daddr:$dport ${NC}"
+    echo -e "${GREEN}成功添加端口转发规则: $sport -> $daddr:$dport ${NC}"
 }
 delete_port_forwarding() {
     echo -e "${BLUE}--- 删除端口转发 (请确保参数与添加时完全一致) ---${NC}"
@@ -478,7 +492,7 @@ main() {
         firewall_type=$(detect_firewall)
         clear
         echo "========================================="
-        echo "         VPS 高级管理脚本 v2.4           "
+        echo "         VPS 高级管理脚本 v2.5           "
         echo "========================================="
         echo " 1. 修改SSH端口"
         echo " 2. 禁止 root 用户 SSH 登录"
