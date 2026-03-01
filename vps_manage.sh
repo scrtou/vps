@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# VPS 高级管理脚本 v3.1.0-TOOLBOX-FINAL
+# VPS 高级管理脚本 v3.1.2-TOOLBOX-FINAL
 #
 # ✅ 保持 v2.7/v2.8 的“完整工具箱”功能 + 已修复/增强：
 # - 账号管理 与 SSH 认证策略 完全分离（state -> /etc/ssh/sshd_config.d/99-vpsmgr.conf）
@@ -22,6 +22,9 @@
 # - sysctl 网络加固（幂等写入）
 # - 快速恶意进程检查
 # - 一键安全初始化（推荐组合）
+#
+# v3.1.2 新增：
+# - ✅ 用户管理：现有用户“移入/移除 sudo(wheel) 组”、查看组成员/授权状态
 # =================================================================
 
 set -uo pipefail
@@ -120,6 +123,85 @@ EOF
       die "sudoers 语法校验失败，已撤销 90-vpsmgr-wheel-group"
     }
     info "已补齐 sudoers：%wheel ALL=(ALL) ALL"
+  fi
+}
+
+# ===== 新增：sudo/wheel 组管理 =====
+detect_admin_group() {
+  # 优先 sudo，其次 wheel
+  if getent group sudo >/dev/null 2>&1; then
+    echo "sudo"
+  elif getent group wheel >/dev/null 2>&1; then
+    echo "wheel"
+  else
+    echo ""
+  fi
+}
+
+add_user_to_admin_group() {
+  local u="$1"
+  id "$u" &>/dev/null || { warn "用户不存在：$u"; return 1; }
+
+  local g
+  g="$(detect_admin_group)"
+  [[ -n "$g" ]] || { warn "系统未找到 sudo/wheel 组"; return 1; }
+
+  ensure_sudo_group_rule || true
+  if id -nG "$u" 2>/dev/null | tr ' ' '\n' | grep -qx "$g"; then
+    warn "用户 $u 已在 $g 组中"
+    return 0
+  fi
+
+  usermod -aG "$g" "$u" || { warn "添加到 $g 组失败"; return 1; }
+  info "已将用户 $u 加入 $g 组"
+  warn "提示：用户加入组后需要退出并重新登录一次才能在会话中生效。"
+}
+
+remove_user_from_admin_group() {
+  local u="$1"
+  id "$u" &>/dev/null || { warn "用户不存在：$u"; return 1; }
+
+  local g
+  g="$(detect_admin_group)"
+  [[ -n "$g" ]] || { warn "系统未找到 sudo/wheel 组"; return 1; }
+
+  # 优先 gpasswd/deluser
+  if command -v gpasswd >/dev/null 2>&1; then
+    gpasswd -d "$u" "$g" >/dev/null 2>&1 || { warn "移除失败（可能本来就不在 $g 组里）"; return 1; }
+    info "已将用户 $u 从 $g 组移除"
+  elif command -v deluser >/dev/null 2>&1; then
+    deluser "$u" "$g" >/dev/null 2>&1 || { warn "移除失败（可能本来就不在 $g 组里）"; return 1; }
+    info "已将用户 $u 从 $g 组移除"
+  else
+    # 兜底：用 usermod -G 重写 supplementary groups（保留其它组）
+    local groups new_groups
+    groups="$(id -nG "$u" 2>/dev/null || true)"
+    [[ -n "$groups" ]] || { warn "无法获取用户组信息"; return 1; }
+
+    new_groups="$(echo "$groups" | tr ' ' '\n' | awk -v rm="$g" '$0!=rm && $0!=""' | paste -sd, -)"
+    # usermod -G 设置 supplementary groups；primary group不受影响
+    usermod -G "${new_groups}" "$u" || { warn "移除失败（usermod -G）"; return 1; }
+    info "已将用户 $u 从 $g 组移除（usermod -G 兜底）"
+  fi
+
+  warn "提示：移除组后需要退出并重新登录一次才能在会话中生效。"
+}
+
+show_admin_group_members() {
+  local g
+  g="$(detect_admin_group)"
+  [[ -n "$g" ]] || { warn "系统未找到 sudo/wheel 组"; return 1; }
+
+  echo -e "${GREEN}--- ${g} 组成员 ---${NC}"
+  getent group "$g" || true
+
+  echo -e "${GREEN}--- sudoers 授权检查（%${g}）---${NC}"
+  local hit
+  hit="$(grep -RIn --no-messages "^[[:space:]]*%${g}[[:space:]]" /etc/sudoers /etc/sudoers.d 2>/dev/null || true)"
+  if [[ -n "$hit" ]]; then
+    echo "$hit"
+  else
+    echo -e "${YELLOW}未找到 %${g} 的 sudoers 授权规则（建议执行：用户管理 -> 修复 sudoers 组授权）${NC}"
   fi
 }
 
@@ -707,7 +789,10 @@ user_management() {
     echo "2. 修改用户密码"
     echo "3. 删除用户"
     echo "4. 列出所有用户"
-    echo "5. 修复 sudoers 组授权（%sudo/%wheel）"
+    echo "5. 将现有用户加入 sudo/wheel 组"
+    echo "6. 将现有用户移出 sudo/wheel 组"
+    echo "7. 查看 sudo/wheel 组成员与 sudoers 授权状态"
+    echo "8. 修复 sudoers 组授权（%sudo/%wheel）"
     echo "0. 返回主菜单"
     echo "============================================"
     read -r -p "请选择操作: " user_choice
@@ -716,7 +801,10 @@ user_management() {
       2) change_user_password ;;
       3) delete_user ;;
       4) list_users ;;
-      5) ensure_sudo_group_rule ;;
+      5) read -r -p "用户名: " u; add_user_to_admin_group "$u" ;;
+      6) read -r -p "用户名: " u; remove_user_from_admin_group "$u" ;;
+      7) show_admin_group_members ;;
+      8) ensure_sudo_group_rule ;;
       0) break ;;
       *) warn "无效选择" ;;
     esac
@@ -741,17 +829,7 @@ add_user() {
   fi
 
   if confirm "是否将用户 $username 添加到 sudo/wheel 组？"; then
-    ensure_sudo_group_rule || true
-    if getent group sudo >/dev/null 2>&1; then
-      usermod -aG sudo "$username"
-      info "已加入 sudo 组"
-    elif getent group wheel >/dev/null 2>&1; then
-      usermod -aG wheel "$username"
-      info "已加入 wheel 组"
-    else
-      warn "未找到 sudo/wheel 组"
-    fi
-    warn "加入 sudo/wheel 后需要退出并重新登录一次才能生效。"
+    add_user_to_admin_group "$username" || true
   fi
 
   warn "下一步：到主菜单【2. SSH 认证策略管理】设置登录策略，并可导入多密钥/从 GitHub 拉取。"
@@ -1440,7 +1518,7 @@ quick_malware_check() {
 
 # ------------------ 一键安全初始化 ------------------
 security_init_full() {
-  echo -e "${BLUE}=== 一键安全初始化（v3.1.0-TOOLBOX-FINAL）===${NC}"
+  echo -e "${BLUE}=== 一键安全初始化（v3.1.x-TOOLBOX）===${NC}"
   echo -e "${YELLOW}将执行：SSH 安全基线（禁root+全局禁密码） + iptables 初始化 + Fail2Ban + sysctl 加固 + Docker 出网策略 + Caddy 防扫描${NC}"
   confirm "确认继续？" || { echo "操作已取消。"; return; }
 
@@ -1469,7 +1547,7 @@ main() {
 
     clear
     echo "=============================================="
-    echo " VPS 高级管理脚本 v3.1.0-TOOLBOX-FINAL (分离版)"
+    echo " VPS 高级管理脚本 v3.1.2-TOOLBOX-FINAL (分离版)"
     echo "=============================================="
     echo " 1. 用户管理（账号：新增/删/改密码/sudo）"
     echo " 2. SSH 认证策略管理（仅密钥/密码/SFTP-only/多密钥/GitHub）"
