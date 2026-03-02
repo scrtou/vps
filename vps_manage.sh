@@ -1,33 +1,22 @@
 #!/bin/bash
 # =================================================================
-# VPS 高级管理脚本 v3.1.2-TOOLBOX-FINAL
+# VPS 高级管理脚本 v3.1.3-TOOLBOX-FINAL
 #
-# ✅ 保持 v2.7/v2.8 的“完整工具箱”功能 + 已修复/增强：
-# - 账号管理 与 SSH 认证策略 完全分离（state -> /etc/ssh/sshd_config.d/99-vpsmgr.conf）
-# - 禁止 root SSH 登录（包括密钥），并清理 sshd_config 中所有非注释 PermitRootLogin 防止混乱
-# - authorized_keys 多密钥：追加/替换/查看/清空，自动去重
-# - GitHub 用户名拉取公钥：https://github.com/<user>.keys
-# - SSH reload/restart 兼容（systemd/service/init.d）
-# - 读取“生效 SSH 配置”用 sshd -T -f /etc/ssh/sshd_config（包含 include）
-# - 自动修复云镜像缺失 sudoers 组授权（%sudo / %wheel）
-#
-# - iptables 自动安装 + 规则保存（含 iptables-persistent 提示）
-# - iptables 初始化：保守模式（VPS-BASELINE 链）/ 强制重置（无 Docker）
-# - 端口开放/关闭（iptables/ufw/firewalld）
-# - 查看防火墙规则
-# - 端口转发管理（iptables NAT）
-# - Fail2Ban 自动安装启用 + 自动读取 SSH 端口（修复 awk in 关键字问题）
-# - Docker 容器出网控制：DOCKER-USER + 自动识别 Docker 子网 + 可清理
-# - Caddy 防扫描 snippet 生成
-# - sysctl 网络加固（幂等写入）
-# - 快速恶意进程检查
-# - 一键安全初始化（推荐组合）
-#
-# v3.1.2 新增：
-# - ✅ 用户管理：现有用户“移入/移除 sudo(wheel) 组”、查看组成员/授权状态
+# v3.1.3 新增/修改：
+# - ✅ 新增“一键 SSH 基线安全初始化”：
+#     禁 root 登录、禁密码登录、SSH 端口=65522、创建/更新 sshUser（sudo 密码 + 公钥）
+# - ✅ 修改“一键安全初始化”中的 SSH 基线步骤：改为调用上述基线函数
+# - ✅ 基线参数在脚本头部可改
 # =================================================================
 
 set -uo pipefail
+
+# ------------------ 一键 SSH 基线参数（可修改） ------------------
+BASELINE_SSH_PORT=65522
+BASELINE_USER="sshUser"
+BASELINE_USER_PASS="sshUser@123"
+BASELINE_USER_PUBKEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFFBTgvrvI2Q7E4CKr0aJNATb2lpGpoLADBl94dEKlkd'
+# ---------------------------------------------------------------
 
 # --- 颜色与兼容：若终端不支持，自动禁用颜色 ---
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
@@ -96,7 +85,6 @@ check_and_install_sudo() {
 }
 
 ensure_sudo_group_rule() {
-  # 自动确保 sudoers 授权 sudo 或 wheel 组（云镜像常缺）
   local has_sudo_rule has_wheel_rule
   has_sudo_rule="$(grep -RIs --no-messages '^[[:space:]]*%sudo[[:space:]]' /etc/sudoers /etc/sudoers.d 2>/dev/null || true)"
   has_wheel_rule="$(grep -RIs --no-messages '^[[:space:]]*%wheel[[:space:]]' /etc/sudoers /etc/sudoers.d 2>/dev/null || true)"
@@ -126,15 +114,11 @@ EOF
   fi
 }
 
-# ===== 新增：sudo/wheel 组管理 =====
+# ===== sudo/wheel 组管理 =====
 detect_admin_group() {
-  # 优先 sudo，其次 wheel
-  if getent group sudo >/dev/null 2>&1; then
-    echo "sudo"
-  elif getent group wheel >/dev/null 2>&1; then
-    echo "wheel"
-  else
-    echo ""
+  if getent group sudo >/dev/null 2>&1; then echo "sudo"
+  elif getent group wheel >/dev/null 2>&1; then echo "wheel"
+  else echo ""
   fi
 }
 
@@ -142,8 +126,7 @@ add_user_to_admin_group() {
   local u="$1"
   id "$u" &>/dev/null || { warn "用户不存在：$u"; return 1; }
 
-  local g
-  g="$(detect_admin_group)"
+  local g; g="$(detect_admin_group)"
   [[ -n "$g" ]] || { warn "系统未找到 sudo/wheel 组"; return 1; }
 
   ensure_sudo_group_rule || true
@@ -161,11 +144,9 @@ remove_user_from_admin_group() {
   local u="$1"
   id "$u" &>/dev/null || { warn "用户不存在：$u"; return 1; }
 
-  local g
-  g="$(detect_admin_group)"
+  local g; g="$(detect_admin_group)"
   [[ -n "$g" ]] || { warn "系统未找到 sudo/wheel 组"; return 1; }
 
-  # 优先 gpasswd/deluser
   if command -v gpasswd >/dev/null 2>&1; then
     gpasswd -d "$u" "$g" >/dev/null 2>&1 || { warn "移除失败（可能本来就不在 $g 组里）"; return 1; }
     info "已将用户 $u 从 $g 组移除"
@@ -173,13 +154,10 @@ remove_user_from_admin_group() {
     deluser "$u" "$g" >/dev/null 2>&1 || { warn "移除失败（可能本来就不在 $g 组里）"; return 1; }
     info "已将用户 $u 从 $g 组移除"
   else
-    # 兜底：用 usermod -G 重写 supplementary groups（保留其它组）
     local groups new_groups
     groups="$(id -nG "$u" 2>/dev/null || true)"
     [[ -n "$groups" ]] || { warn "无法获取用户组信息"; return 1; }
-
     new_groups="$(echo "$groups" | tr ' ' '\n' | awk -v rm="$g" '$0!=rm && $0!=""' | paste -sd, -)"
-    # usermod -G 设置 supplementary groups；primary group不受影响
     usermod -G "${new_groups}" "$u" || { warn "移除失败（usermod -G）"; return 1; }
     info "已将用户 $u 从 $g 组移除（usermod -G 兜底）"
   fi
@@ -188,8 +166,7 @@ remove_user_from_admin_group() {
 }
 
 show_admin_group_members() {
-  local g
-  g="$(detect_admin_group)"
+  local g; g="$(detect_admin_group)"
   [[ -n "$g" ]] || { warn "系统未找到 sudo/wheel 组"; return 1; }
 
   echo -e "${GREEN}--- ${g} 组成员 ---${NC}"
@@ -513,12 +490,10 @@ sshd_supports_include_dir() {
 }
 
 cleanup_legacy_blocks_in_sshd_config() {
-  # 清理旧脚本往 sshd_config 末尾追加的 managed block（避免混乱）
   sed -i "/^${OLD_POLICY_BEGIN}$/,/^${OLD_POLICY_END}$/d" "$SSHD_CONFIG" 2>/dev/null || true
   sed -i "/^${OLD_GLOBAL_BEGIN}$/,/^${OLD_GLOBAL_END}$/d" "$SSHD_CONFIG" 2>/dev/null || true
   sed -i "/^${OLD_USER_BEGIN}$/,/^${OLD_USER_END}$/d" "$SSHD_CONFIG" 2>/dev/null || true
-
-  # 关键：清掉所有非注释 PermitRootLogin（避免被默认 prohibit-password 误导/覆盖）
+  # 关键：清掉所有非注释 PermitRootLogin（避免默认 prohibit-password 抢回）
   sed -i -E '/^[[:space:]]*PermitRootLogin[[:space:]]+/d' "$SSHD_CONFIG" 2>/dev/null || true
 }
 
@@ -620,6 +595,343 @@ ssh_policy_clear_all() {
   info "已清理 VPSMGR SSH 策略（99-vpsmgr.conf + state + legacy 清理）"
 }
 
+# ------------------ iptables / firewall ------------------
+check_and_install_iptables() {
+  command -v iptables &>/dev/null && return 0
+  warn "检测到 iptables 未安装，正在尝试自动安装..."
+  case "$(detect_pkg_mgr)" in
+    apt)
+      apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y iptables
+      ;;
+    dnf)
+      dnf install -y iptables iptables-services
+      systemctl enable --now iptables 2>/dev/null || true
+      ;;
+    yum)
+      yum install -y iptables iptables-services
+      systemctl enable --now iptables 2>/dev/null || true
+      ;;
+    *) warn "无法识别包管理器，iptables 安装失败"; return 1 ;;
+  esac
+  command -v iptables &>/dev/null || { warn "iptables 安装失败或不可用"; return 1; }
+  info "iptables 已可用：$(iptables --version 2>/dev/null | head -n1)"
+  command -v ip6tables &>/dev/null && info "ip6tables 已可用" || warn "未检测到 ip6tables，将跳过 IPv6 规则"
+  return 0
+}
+
+detect_firewall() {
+  if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+    echo "firewalld"
+  elif command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qi "Status: active"; then
+    echo "ufw"
+  elif command -v iptables &>/dev/null; then
+    echo "iptables"
+  else
+    echo "none"
+  fi
+}
+
+save_iptables_rules() {
+  command -v iptables-save &>/dev/null || { warn "未找到 iptables-save，无法保存规则"; return 1; }
+
+  if [ -d /etc/iptables ]; then
+    iptables-save > /etc/iptables/rules.v4
+    command -v ip6tables-save &>/dev/null && ip6tables-save > /etc/iptables/rules.v6 || true
+    echo "iptables 规则已保存。"
+  elif [ -d /etc/sysconfig ]; then
+    iptables-save > /etc/sysconfig/iptables
+    command -v ip6tables-save &>/dev/null && ip6tables-save > /etc/sysconfig/ip6tables || true
+    echo "iptables 规则已保存。"
+  elif command -v apt-get &>/dev/null; then
+    warn "为了在重启后保留防火墙规则，建议安装 iptables-persistent。"
+    if confirm "是否现在自动安装 iptables-persistent？"; then
+      apt-get update >/dev/null 2>&1
+      DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent >/dev/null 2>&1 || true
+      if [ -d /etc/iptables ]; then
+        iptables-save > /etc/iptables/rules.v4
+        command -v ip6tables-save &>/dev/null && ip6tables-save > /etc/iptables/rules.v6 || true
+        info "安装成功，规则已保存。"
+      else
+        warn "已尝试安装 iptables-persistent，但未发现 /etc/iptables，请自行确认持久化。"
+      fi
+    else
+      warn "已取消。提示：规则可能不会在重启后保留。"
+    fi
+  else
+    warn "未找到标准保存路径，规则可能不会在重启后保留。"
+  fi
+}
+
+enable_iptables() {
+  echo -e "${GREEN}正在配置 iptables 基础规则 (IPv4 & IPv6)...${NC}"
+  check_and_install_iptables || return 1
+
+  local current_ssh_port docker_present mode
+  current_ssh_port="$(get_effective_ssh_port)"
+
+  docker_present="no"
+  if command -v docker &>/dev/null; then
+    iptables -S 2>/dev/null | grep -qE '^-N DOCKER\b' && docker_present="yes"
+  fi
+
+  echo -e "${YELLOW}请选择 iptables 初始化模式：${NC}"
+  echo "1) 保守模式（推荐）：不清空现有规则，只维护 VPS-BASELINE 链并插入 jump"
+  echo "2) 强制重置：清空并重置 filter 规则（可能影响业务；Docker 存在时不建议）"
+  read -r -p "请选择(1/2，默认1): " mode
+  [[ -z "$mode" ]] && mode="1"
+
+  if [[ "$docker_present" == "yes" && "$mode" == "2" ]]; then
+    warn "检测到 Docker：强制重置可能破坏容器网络。已自动降级为保守模式。"
+    mode="1"
+  fi
+
+  if [[ "$mode" == "1" ]]; then
+    local chain="VPS-BASELINE"
+    iptables -N "$chain" 2>/dev/null || true
+    iptables -F "$chain" 2>/dev/null || true
+    iptables -C INPUT -j "$chain" 2>/dev/null || iptables -I INPUT 1 -j "$chain"
+
+    iptables -A "$chain" -i lo -j ACCEPT
+    iptables -A "$chain" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    iptables -A "$chain" -p tcp --dport "$current_ssh_port" -j ACCEPT
+    iptables -A "$chain" -p tcp --dport 80 -j ACCEPT
+    iptables -A "$chain" -p tcp --dport 443 -j ACCEPT
+    iptables -A "$chain" -p icmp --icmp-type echo-request -j ACCEPT
+    iptables -A "$chain" -j RETURN
+
+    if command -v ip6tables &>/dev/null; then
+      ip6tables -N "$chain" 2>/dev/null || true
+      ip6tables -F "$chain" 2>/dev/null || true
+      ip6tables -C INPUT -j "$chain" 2>/dev/null || ip6tables -I INPUT 1 -j "$chain"
+
+      ip6tables -A "$chain" -i lo -j ACCEPT
+      ip6tables -A "$chain" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+      ip6tables -A "$chain" -p tcp --dport "$current_ssh_port" -j ACCEPT
+      ip6tables -A "$chain" -p tcp --dport 80 -j ACCEPT
+      ip6tables -A "$chain" -p tcp --dport 443 -j ACCEPT
+      ip6tables -A "$chain" -p ipv6-icmp -j ACCEPT
+      ip6tables -A "$chain" -j RETURN
+    fi
+
+    warn "是否把 INPUT 默认策略设为 DROP（更安全但可能影响未放行业务）？"
+    if confirm "确认设置 INPUT=DROP？"; then
+      iptables -P INPUT DROP
+      iptables -P OUTPUT ACCEPT
+      if [[ "$docker_present" == "yes" ]]; then
+        warn "检测到 Docker：保持 FORWARD 策略不改（避免容器网络异常）"
+      else
+        iptables -P FORWARD DROP
+      fi
+      if command -v ip6tables &>/dev/null; then
+        ip6tables -P INPUT DROP
+        ip6tables -P OUTPUT ACCEPT
+        [[ "$docker_present" != "yes" ]] && ip6tables -P FORWARD DROP || true
+      fi
+    else
+      warn "保守模式：未改变默认策略（仅插入允许链）。"
+    fi
+
+    save_iptables_rules || true
+    info "iptables 保守初始化完成：开放 SSH($current_ssh_port), 80, 443, ICMP；尽量不破坏现有规则"
+    return 0
+  fi
+
+  warn "强制重置将清空现有 filter 规则。"
+  confirm "确定继续？" || { echo "已取消。"; return 0; }
+
+  iptables -F && iptables -X && iptables -Z || { warn "iptables 初始化失败"; return 1; }
+  iptables -P INPUT DROP
+  iptables -P FORWARD DROP
+  iptables -P OUTPUT ACCEPT
+  iptables -A INPUT -i lo -j ACCEPT
+  iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  iptables -A INPUT -p tcp --dport "$current_ssh_port" -j ACCEPT
+  iptables -A INPUT -p tcp --dport 80 -j ACCEPT
+  iptables -A INPUT -p tcp --dport 443 -j ACCEPT
+  iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+
+  if command -v ip6tables &>/dev/null; then
+    ip6tables -F && ip6tables -X && ip6tables -Z || true
+    ip6tables -P INPUT DROP
+    ip6tables -P FORWARD DROP
+    ip6tables -P OUTPUT ACCEPT
+    ip6tables -A INPUT -i lo -j ACCEPT
+    ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    ip6tables -A INPUT -p ipv6-icmp -j ACCEPT
+    ip6tables -A INPUT -p tcp --dport "$current_ssh_port" -j ACCEPT
+    ip6tables -A INPUT -p tcp --dport 80 -j ACCEPT
+    ip6tables -A INPUT -p tcp --dport 443 -j ACCEPT
+  fi
+
+  save_iptables_rules || true
+  info "iptables 已强制重置，默认开放：SSH($current_ssh_port), 80, 443, ICMP"
+}
+
+configure_ports() {
+  local firewall; firewall="$(detect_firewall)"
+  [[ "$firewall" != "none" ]] || { warn "未检测到可用防火墙（iptables/ufw/firewalld）"; return 1; }
+
+  echo "===== 配置防火墙端口 (当前: $firewall) ====="
+  echo "1. 开放端口"
+  echo "2. 关闭端口"
+  read -r -p "请选择操作: " action
+  read -r -p "请输入端口号: " port
+  if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+    warn "无效端口号"
+    return 1
+  fi
+  read -r -p "选择协议 (tcp/udp/both): " protocol
+  if [[ "$protocol" != "tcp" && "$protocol" != "udp" && "$protocol" != "both" ]]; then
+    warn "无效协议"
+    return 1
+  fi
+
+  if [[ "$firewall" == "iptables" ]]; then
+    local rule_action="-A" op_text="开放"
+    [[ "$action" == "2" ]] && rule_action="-D" && op_text="关闭"
+
+    local chain="INPUT"
+    iptables -nL VPS-BASELINE >/dev/null 2>&1 && chain="VPS-BASELINE"
+
+    if [[ "$protocol" == "tcp" || "$protocol" == "both" ]]; then
+      iptables "$rule_action" "$chain" -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+      command -v ip6tables &>/dev/null && ip6tables "$rule_action" "$chain" -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+      info "iptables: 已${op_text} TCP 端口 $port"
+    fi
+    if [[ "$protocol" == "udp" || "$protocol" == "both" ]]; then
+      iptables "$rule_action" "$chain" -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+      command -v ip6tables &>/dev/null && ip6tables "$rule_action" "$chain" -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+      info "iptables: 已${op_text} UDP 端口 $port"
+    fi
+    save_iptables_rules || true
+  elif [[ "$firewall" == "ufw" ]]; then
+    local proto_list=()
+    [[ "$protocol" == "tcp" || "$protocol" == "both" ]] && proto_list+=("tcp")
+    [[ "$protocol" == "udp" || "$protocol" == "both" ]] && proto_list+=("udp")
+    for p in "${proto_list[@]}"; do
+      if [[ "$action" == "1" ]]; then
+        ufw allow "${port}/${p}" >/dev/null 2>&1 || true
+        info "ufw: 已开放 ${port}/${p}"
+      else
+        ufw delete allow "${port}/${p}" >/dev/null 2>&1 || true
+        info "ufw: 已关闭 ${port}/${p}"
+      fi
+    done
+  elif [[ "$firewall" == "firewalld" ]]; then
+    local op="--add-port" op_text="开放"
+    [[ "$action" == "2" ]] && op="--remove-port" && op_text="关闭"
+    if [[ "$protocol" == "tcp" || "$protocol" == "both" ]]; then
+      firewall-cmd --permanent "$op=${port}/tcp" >/dev/null 2>&1 || true
+      info "firewalld: 已${op_text} ${port}/tcp"
+    fi
+    if [[ "$protocol" == "udp" || "$protocol" == "both" ]]; then
+      firewall-cmd --permanent "$op=${port}/udp" >/dev/null 2>&1 || true
+      info "firewalld: 已${op_text} ${port}/udp"
+    fi
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+}
+
+show_firewall_rules() {
+  local firewall; firewall="$(detect_firewall)"
+  echo -e "${GREEN}--- 当前防火墙规则 ($firewall) ---${NC}"
+  case "$firewall" in
+    firewalld) firewall-cmd --list-all ;;
+    ufw) ufw status verbose ;;
+    iptables)
+      echo -e "${BLUE}--- IPv4 (iptables) ---${NC}"
+      iptables -L -n -v --line-numbers
+      if command -v ip6tables &>/dev/null; then
+        echo -e "\n${BLUE}--- IPv6 (ip6tables) ---${NC}"
+        ip6tables -L -n -v --line-numbers
+      else
+        echo -e "\n${YELLOW}未安装 ip6tables，IPv6 规则未显示。${NC}"
+      fi
+      ;;
+    *) echo "没有活动的防火墙服务。" ;;
+  esac
+}
+
+# ------------------ 端口转发（iptables NAT） ------------------
+port_forwarding_menu() {
+  if [[ "$(detect_firewall)" != "iptables" ]]; then
+    warn "端口转发功能目前仅支持 iptables。"
+    return
+  fi
+  while true; do
+    echo -e "\n===== 端口转发管理 (仅IPv4) ====="
+    echo "1. 添加端口转发"
+    echo "2. 删除端口转发"
+    echo "3. 查看当前转发规则"
+    echo "0. 返回主菜单"
+    echo "=============================="
+    read -r -p "请选择操作: " choice
+    case $choice in
+      1) add_port_forwarding ;;
+      2) delete_port_forwarding ;;
+      3) view_port_forwarding ;;
+      0) break ;;
+      *) warn "无效选择" ;;
+    esac
+  done
+}
+
+enable_ip_forwarding() {
+  if ! grep -q -E "^\s*net.ipv4.ip_forward\s*=\s*1" "$SYSCTL_CONFIG"; then
+    sed -i '/^\s*#\?\s*net.ipv4.ip_forward/d' "$SYSCTL_CONFIG"
+    echo "net.ipv4.ip_forward=1" >> "$SYSCTL_CONFIG"
+  fi
+  sysctl -p "$SYSCTL_CONFIG" >/dev/null 2>&1 || true
+}
+
+add_port_forwarding() {
+  echo -e "${BLUE}--- 添加端口转发 ---${NC}"
+  read -r -p "协议 (tcp/udp): " proto
+  [[ "$proto" == "tcp" || "$proto" == "udp" ]] || { warn "无效协议"; return 1; }
+
+  read -r -p "源端口: " sport
+  [[ "$sport" =~ ^[0-9]+$ ]] || { warn "无效源端口"; return 1; }
+
+  read -r -p "目标IP(空=127.0.0.1): " daddr
+  [[ -z "$daddr" ]] && daddr="127.0.0.1"
+
+  read -r -p "目标端口: " dport
+  [[ "$dport" =~ ^[0-9]+$ ]] || { warn "无效目标端口"; return 1; }
+
+  enable_ip_forwarding
+
+  iptables -t nat -A PREROUTING -p "$proto" --dport "$sport" -j DNAT --to-destination "${daddr}:${dport}" || return 1
+  if [[ "$daddr" != "127.0.0.1" ]]; then
+    iptables -A FORWARD -p "$proto" -d "$daddr" --dport "$dport" -j ACCEPT || return 1
+  fi
+  iptables -t nat -A POSTROUTING -p "$proto" -d "$daddr" --dport "$dport" -j MASQUERADE || return 1
+
+  save_iptables_rules || true
+  info "已添加转发：$sport -> $daddr:$dport"
+}
+
+delete_port_forwarding() {
+  echo -e "${BLUE}--- 删除端口转发 ---${NC}"
+  read -r -p "协议 (tcp/udp): " proto
+  read -r -p "源端口: " sport
+  read -r -p "目标IP(空=127.0.0.1): " daddr
+  [[ -z "$daddr" ]] && daddr="127.0.0.1"
+  read -r -p "目标端口: " dport
+
+  iptables -t nat -D PREROUTING -p "$proto" --dport "$sport" -j DNAT --to-destination "${daddr}:${dport}" 2>/dev/null || true
+  [[ "$daddr" != "127.0.0.1" ]] && iptables -D FORWARD -p "$proto" -d "$daddr" --dport "$dport" -j ACCEPT 2>/dev/null || true
+  iptables -t nat -D POSTROUTING -p "$proto" -d "$daddr" --dport "$dport" -j MASQUERADE 2>/dev/null || true
+
+  save_iptables_rules || true
+  info "已尝试删除转发：$sport -> $daddr:$dport"
+}
+
+view_port_forwarding() {
+  echo -e "${BLUE}--- 当前 NAT PREROUTING 规则 ---${NC}"
+  iptables -t nat -L PREROUTING -n -v --line-numbers
+}
+
 # ------------------ Fail2Ban（安装/启用） ------------------
 fail2ban_backend_detect() {
   if command -v systemctl >/dev/null 2>&1 && command -v journalctl >/dev/null 2>&1; then
@@ -666,7 +978,6 @@ EOF
   fi
 }
 
-# 修复 awk 关键字 in：用 in_sshd
 update_fail2ban_port_if_present() {
   local new_port="$1"
   local jail="/etc/fail2ban/jail.local"
@@ -703,7 +1014,7 @@ update_fail2ban_port_if_present() {
   fi
 }
 
-# ------------------ SSH 端口修改（显示生效端口） ------------------
+# ------------------ SSH 端口修改（交互） ------------------
 change_ssh_port() {
   echo -e "${BLUE}--- 修改 SSH 端口 ---${NC}"
   local old_port; old_port="$(get_effective_ssh_port)"
@@ -712,12 +1023,22 @@ change_ssh_port() {
   grep -nE "^\s*#?\s*Port\s+" "$SSHD_CONFIG" || true
 
   read -r -p "请输入新的SSH端口号 (1-65535): " new_port
+  set_ssh_port_noninteractive "$new_port"
+}
+
+# ------------------ SSH 端口修改（非交互：供“一键基线”调用） ------------------
+set_ssh_port_noninteractive() {
+  local new_port="${1:-}"
   if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
-    warn "无效端口号"
+    warn "无效端口号：$new_port"
     return 1
   fi
 
-  local backup_file; backup_file="$(ssh_backup_config)"
+  local old_port backup_file
+  old_port="$(get_effective_ssh_port)"
+  [[ "$old_port" == "$new_port" ]] && { info "SSH 端口已是 $new_port，无需修改"; return 0; }
+
+  backup_file="$(ssh_backup_config)"
 
   # 删除所有 Port 行，避免重复；插入到第一个 Match 之前
   sed -i -E '/^\s*#?\s*Port\s+[0-9]+/d' "$SSHD_CONFIG" 2>/dev/null || true
@@ -742,7 +1063,7 @@ change_ssh_port() {
     return 1
   fi
 
-  # 防火墙放行（若启用 iptables baseline 链则更新它）
+  # 防火墙放行（iptables/ufw/firewalld）
   local firewall_type; firewall_type="$(detect_firewall)"
   if [[ "$firewall_type" == "iptables" ]] && command -v iptables &>/dev/null; then
     echo "正在为 iptables 添加新端口规则..."
@@ -779,6 +1100,64 @@ change_ssh_port() {
     ssh_reload_or_restart || true
     return 1
   fi
+}
+
+# ------------------ 一键 SSH 基线安全初始化（新增） ------------------
+ensure_baseline_user() {
+  local u="$1" pass="$2" pubkey="$3"
+
+  # 1) 创建/确保用户存在
+  if ! id "$u" &>/dev/null; then
+    useradd -m -s /bin/bash "$u" || die "创建用户失败：$u"
+    info "已创建用户：$u"
+  else
+    info "用户已存在：$u（将更新密码/公钥/组）"
+  fi
+
+  # 2) 设置密码（用于 sudo）
+  if command -v chpasswd >/dev/null 2>&1; then
+    printf '%s:%s\n' "$u" "$pass" | chpasswd || die "设置用户密码失败：$u"
+    info "已更新密码：$u"
+  else
+    die "未找到 chpasswd，无法非交互设置密码"
+  fi
+
+  # 3) 加入 sudo/wheel
+  add_user_to_admin_group "$u" || true
+
+  # 4) 写入公钥
+  append_keys_to_user "$u" "$pubkey"
+}
+
+ssh_baseline_init() {
+  echo -e "${BLUE}=== 一键 SSH 基线安全初始化 ===${NC}"
+  echo -e "${YELLOW}将执行：${NC}"
+  echo " - 禁 root SSH 登录（包括密钥）"
+  echo " - 禁 SSH 密码登录（Password + KbdInteractive）"
+  echo " - SSH 端口改为：${BASELINE_SSH_PORT}"
+  echo " - 创建/更新用户：${BASELINE_USER}"
+  echo "   * sudo 密码：${BASELINE_USER_PASS}"
+  echo "   * 公钥：${BASELINE_USER_PUBKEY:0:40}..."
+  warn "强烈建议：保持当前 SSH 会话不退出，直到你验证能用新用户+新端口登录。"
+  confirm "确认继续？" || { echo "操作已取消。"; return 0; }
+
+  policy_state_init
+  ensure_sudo_group_rule || true
+
+  # 先创建/更新用户与密钥，避免锁死
+  ensure_baseline_user "$BASELINE_USER" "$BASELINE_USER_PASS" "$BASELINE_USER_PUBKEY"
+
+  # 应用 SSH 策略：禁 root、禁密码；并强制该用户 keyonly
+  policy_state_set_global_password no
+  policy_state_set_user "$BASELINE_USER" "keyonly"
+  ssh_policy_apply || return 1
+
+  # 修改端口到基线端口
+  set_ssh_port_noninteractive "$BASELINE_SSH_PORT" || return 1
+
+  info "SSH 基线初始化完成。"
+  echo -e "${YELLOW}下一步请在本地新开终端测试：${NC}"
+  echo "  ssh -p ${BASELINE_SSH_PORT} ${BASELINE_USER}@<你的服务器IP>"
 }
 
 # ------------------ 用户管理（只管账号，不改 SSH 策略） ------------------
@@ -967,349 +1346,7 @@ ssh_policy_menu() {
   done
 }
 
-# ------------------ iptables 安装/持久化/检测 ------------------
-check_and_install_iptables() {
-  command -v iptables &>/dev/null && return 0
-
-  warn "检测到 iptables 未安装，正在尝试自动安装..."
-  case "$(detect_pkg_mgr)" in
-    apt)
-      apt-get update
-      DEBIAN_FRONTEND=noninteractive apt-get install -y iptables
-      ;;
-    dnf)
-      dnf install -y iptables iptables-services
-      systemctl enable --now iptables 2>/dev/null || true
-      ;;
-    yum)
-      yum install -y iptables iptables-services
-      systemctl enable --now iptables 2>/dev/null || true
-      ;;
-    *) warn "无法识别包管理器，iptables 安装失败"; return 1 ;;
-  esac
-
-  command -v iptables &>/dev/null || { warn "iptables 安装失败或不可用"; return 1; }
-  info "iptables 已可用：$(iptables --version 2>/dev/null | head -n1)"
-  command -v ip6tables &>/dev/null && info "ip6tables 已可用" || warn "未检测到 ip6tables，将跳过 IPv6 规则"
-  return 0
-}
-
-detect_firewall() {
-  if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
-    echo "firewalld"
-  elif command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qi "Status: active"; then
-    echo "ufw"
-  elif command -v iptables &>/dev/null; then
-    echo "iptables"
-  else
-    echo "none"
-  fi
-}
-
-save_iptables_rules() {
-  command -v iptables-save &>/dev/null || { warn "未找到 iptables-save，无法保存规则"; return 1; }
-
-  if [ -d /etc/iptables ]; then
-    iptables-save > /etc/iptables/rules.v4
-    command -v ip6tables-save &>/dev/null && ip6tables-save > /etc/iptables/rules.v6 || true
-    echo "iptables 规则已保存。"
-  elif [ -d /etc/sysconfig ]; then
-    iptables-save > /etc/sysconfig/iptables
-    command -v ip6tables-save &>/dev/null && ip6tables-save > /etc/sysconfig/ip6tables || true
-    echo "iptables 规则已保存。"
-  elif command -v apt-get &>/dev/null; then
-    warn "为了在重启后保留防火墙规则，建议安装 iptables-persistent。"
-    if confirm "是否现在自动安装 iptables-persistent？"; then
-      apt-get update >/dev/null 2>&1
-      DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent >/dev/null 2>&1 || true
-      if [ -d /etc/iptables ]; then
-        iptables-save > /etc/iptables/rules.v4
-        command -v ip6tables-save &>/dev/null && ip6tables-save > /etc/iptables/rules.v6 || true
-        info "安装成功，规则已保存。"
-      else
-        warn "已尝试安装 iptables-persistent，但未发现 /etc/iptables，请自行确认持久化。"
-      fi
-    else
-      warn "已取消。提示：规则可能不会在重启后保留。"
-    fi
-  else
-    warn "未找到标准保存路径，规则可能不会在重启后保留。"
-  fi
-}
-
-enable_iptables() {
-  echo -e "${GREEN}正在配置 iptables 基础规则 (IPv4 & IPv6)...${NC}"
-  check_and_install_iptables || return 1
-
-  local current_ssh_port docker_present mode
-  current_ssh_port="$(get_effective_ssh_port)"
-
-  docker_present="no"
-  if command -v docker &>/dev/null; then
-    iptables -S 2>/dev/null | grep -qE '^-N DOCKER\b' && docker_present="yes"
-  fi
-
-  echo -e "${YELLOW}请选择 iptables 初始化模式：${NC}"
-  echo "1) 保守模式（推荐）：不清空现有规则，只维护 VPS-BASELINE 链并插入 jump"
-  echo "2) 强制重置：清空并重置 filter 规则（可能影响业务；Docker 存在时不建议）"
-  read -r -p "请选择(1/2，默认1): " mode
-  [[ -z "$mode" ]] && mode="1"
-
-  if [[ "$docker_present" == "yes" && "$mode" == "2" ]]; then
-    warn "检测到 Docker：强制重置可能破坏容器网络。已自动降级为保守模式。"
-    mode="1"
-  fi
-
-  if [[ "$mode" == "1" ]]; then
-    local chain="VPS-BASELINE"
-    iptables -N "$chain" 2>/dev/null || true
-    iptables -F "$chain" 2>/dev/null || true
-    iptables -C INPUT -j "$chain" 2>/dev/null || iptables -I INPUT 1 -j "$chain"
-
-    iptables -A "$chain" -i lo -j ACCEPT
-    iptables -A "$chain" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    iptables -A "$chain" -p tcp --dport "$current_ssh_port" -j ACCEPT
-    iptables -A "$chain" -p tcp --dport 80 -j ACCEPT
-    iptables -A "$chain" -p tcp --dport 443 -j ACCEPT
-    iptables -A "$chain" -p icmp --icmp-type echo-request -j ACCEPT
-    iptables -A "$chain" -j RETURN
-
-    if command -v ip6tables &>/dev/null; then
-      ip6tables -N "$chain" 2>/dev/null || true
-      ip6tables -F "$chain" 2>/dev/null || true
-      ip6tables -C INPUT -j "$chain" 2>/dev/null || ip6tables -I INPUT 1 -j "$chain"
-
-      ip6tables -A "$chain" -i lo -j ACCEPT
-      ip6tables -A "$chain" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-      ip6tables -A "$chain" -p tcp --dport "$current_ssh_port" -j ACCEPT
-      ip6tables -A "$chain" -p tcp --dport 80 -j ACCEPT
-      ip6tables -A "$chain" -p tcp --dport 443 -j ACCEPT
-      ip6tables -A "$chain" -p ipv6-icmp -j ACCEPT
-      ip6tables -A "$chain" -j RETURN
-    fi
-
-    warn "是否把 INPUT 默认策略设为 DROP（更安全但可能影响未放行业务）？"
-    if confirm "确认设置 INPUT=DROP？"; then
-      iptables -P INPUT DROP
-      iptables -P OUTPUT ACCEPT
-      if [[ "$docker_present" == "yes" ]]; then
-        warn "检测到 Docker：保持 FORWARD 策略不改（避免容器网络异常）"
-      else
-        iptables -P FORWARD DROP
-      fi
-      if command -v ip6tables &>/dev/null; then
-        ip6tables -P INPUT DROP
-        ip6tables -P OUTPUT ACCEPT
-        [[ "$docker_present" != "yes" ]] && ip6tables -P FORWARD DROP || true
-      fi
-    else
-      warn "保守模式：未改变默认策略（仅插入允许链）。"
-    fi
-
-    save_iptables_rules || true
-    info "iptables 保守初始化完成：开放 SSH($current_ssh_port), 80, 443, ICMP；尽量不破坏现有规则"
-    return 0
-  fi
-
-  warn "强制重置将清空现有 filter 规则。"
-  confirm "确定继续？" || { echo "已取消。"; return 0; }
-
-  iptables -F && iptables -X && iptables -Z || { warn "iptables 初始化失败"; return 1; }
-  iptables -P INPUT DROP
-  iptables -P FORWARD DROP
-  iptables -P OUTPUT ACCEPT
-  iptables -A INPUT -i lo -j ACCEPT
-  iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  iptables -A INPUT -p tcp --dport "$current_ssh_port" -j ACCEPT
-  iptables -A INPUT -p tcp --dport 80 -j ACCEPT
-  iptables -A INPUT -p tcp --dport 443 -j ACCEPT
-  iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
-
-  if command -v ip6tables &>/dev/null; then
-    ip6tables -F && ip6tables -X && ip6tables -Z || true
-    ip6tables -P INPUT DROP
-    ip6tables -P FORWARD DROP
-    ip6tables -P OUTPUT ACCEPT
-    ip6tables -A INPUT -i lo -j ACCEPT
-    ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    ip6tables -A INPUT -p ipv6-icmp -j ACCEPT
-    ip6tables -A INPUT -p tcp --dport "$current_ssh_port" -j ACCEPT
-    ip6tables -A INPUT -p tcp --dport 80 -j ACCEPT
-    ip6tables -A INPUT -p tcp --dport 443 -j ACCEPT
-  fi
-
-  save_iptables_rules || true
-  info "iptables 已强制重置，默认开放：SSH($current_ssh_port), 80, 443, ICMP"
-}
-
-configure_ports() {
-  local firewall; firewall="$(detect_firewall)"
-  [[ "$firewall" != "none" ]] || { warn "未检测到可用防火墙（iptables/ufw/firewalld）"; return 1; }
-
-  echo "===== 配置防火墙端口 (当前: $firewall) ====="
-  echo "1. 开放端口"
-  echo "2. 关闭端口"
-  read -r -p "请选择操作: " action
-  read -r -p "请输入端口号: " port
-  if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-    warn "无效端口号"
-    return 1
-  fi
-  read -r -p "选择协议 (tcp/udp/both): " protocol
-  if [[ "$protocol" != "tcp" && "$protocol" != "udp" && "$protocol" != "both" ]]; then
-    warn "无效协议"
-    return 1
-  fi
-
-  if [[ "$firewall" == "iptables" ]]; then
-    local rule_action="-A" op_text="开放"
-    [[ "$action" == "2" ]] && rule_action="-D" && op_text="关闭"
-
-    # 若存在 VPS-BASELINE，优先对其操作
-    local chain="INPUT"
-    iptables -nL VPS-BASELINE >/dev/null 2>&1 && chain="VPS-BASELINE"
-
-    if [[ "$protocol" == "tcp" || "$protocol" == "both" ]]; then
-      iptables "$rule_action" "$chain" -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
-      command -v ip6tables &>/dev/null && ip6tables "$rule_action" "$chain" -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
-      info "iptables: 已${op_text} TCP 端口 $port"
-    fi
-    if [[ "$protocol" == "udp" || "$protocol" == "both" ]]; then
-      iptables "$rule_action" "$chain" -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
-      command -v ip6tables &>/dev/null && ip6tables "$rule_action" "$chain" -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
-      info "iptables: 已${op_text} UDP 端口 $port"
-    fi
-    save_iptables_rules || true
-
-  elif [[ "$firewall" == "ufw" ]]; then
-    local proto_list=()
-    [[ "$protocol" == "tcp" || "$protocol" == "both" ]] && proto_list+=("tcp")
-    [[ "$protocol" == "udp" || "$protocol" == "both" ]] && proto_list+=("udp")
-    for p in "${proto_list[@]}"; do
-      if [[ "$action" == "1" ]]; then
-        ufw allow "${port}/${p}" >/dev/null 2>&1 || true
-        info "ufw: 已开放 ${port}/${p}"
-      else
-        ufw delete allow "${port}/${p}" >/dev/null 2>&1 || true
-        info "ufw: 已关闭 ${port}/${p}"
-      fi
-    done
-
-  elif [[ "$firewall" == "firewalld" ]]; then
-    local op="--add-port" op_text="开放"
-    [[ "$action" == "2" ]] && op="--remove-port" && op_text="关闭"
-    if [[ "$protocol" == "tcp" || "$protocol" == "both" ]]; then
-      firewall-cmd --permanent "$op=${port}/tcp" >/dev/null 2>&1 || true
-      info "firewalld: 已${op_text} ${port}/tcp"
-    fi
-    if [[ "$protocol" == "udp" || "$protocol" == "both" ]]; then
-      firewall-cmd --permanent "$op=${port}/udp" >/dev/null 2>&1 || true
-      info "firewalld: 已${op_text} ${port}/udp"
-    fi
-    firewall-cmd --reload >/dev/null 2>&1 || true
-  fi
-}
-
-show_firewall_rules() {
-  local firewall; firewall="$(detect_firewall)"
-  echo -e "${GREEN}--- 当前防火墙规则 ($firewall) ---${NC}"
-  case "$firewall" in
-    firewalld) firewall-cmd --list-all ;;
-    ufw) ufw status verbose ;;
-    iptables)
-      echo -e "${BLUE}--- IPv4 (iptables) ---${NC}"
-      iptables -L -n -v --line-numbers
-      if command -v ip6tables &>/dev/null; then
-        echo -e "\n${BLUE}--- IPv6 (ip6tables) ---${NC}"
-        ip6tables -L -n -v --line-numbers
-      else
-        echo -e "\n${YELLOW}未安装 ip6tables，IPv6 规则未显示。${NC}"
-      fi
-      ;;
-    *) echo "没有活动的防火墙服务。" ;;
-  esac
-}
-
-# ------------------ 端口转发（iptables NAT） ------------------
-port_forwarding_menu() {
-  if [[ "$(detect_firewall)" != "iptables" ]]; then
-    warn "端口转发功能目前仅支持 iptables。"
-    return
-  fi
-  while true; do
-    echo -e "\n===== 端口转发管理 (仅IPv4) ====="
-    echo "1. 添加端口转发"
-    echo "2. 删除端口转发"
-    echo "3. 查看当前转发规则"
-    echo "0. 返回主菜单"
-    echo "=============================="
-    read -r -p "请选择操作: " choice
-    case $choice in
-      1) add_port_forwarding ;;
-      2) delete_port_forwarding ;;
-      3) view_port_forwarding ;;
-      0) break ;;
-      *) warn "无效选择" ;;
-    esac
-  done
-}
-
-enable_ip_forwarding() {
-  if ! grep -q -E "^\s*net.ipv4.ip_forward\s*=\s*1" "$SYSCTL_CONFIG"; then
-    sed -i '/^\s*#\?\s*net.ipv4.ip_forward/d' "$SYSCTL_CONFIG"
-    echo "net.ipv4.ip_forward=1" >> "$SYSCTL_CONFIG"
-  fi
-  sysctl -p "$SYSCTL_CONFIG" >/dev/null 2>&1 || true
-}
-
-add_port_forwarding() {
-  echo -e "${BLUE}--- 添加端口转发 ---${NC}"
-  read -r -p "协议 (tcp/udp): " proto
-  [[ "$proto" == "tcp" || "$proto" == "udp" ]] || { warn "无效协议"; return 1; }
-
-  read -r -p "源端口: " sport
-  [[ "$sport" =~ ^[0-9]+$ ]] || { warn "无效源端口"; return 1; }
-
-  read -r -p "目标IP(空=127.0.0.1): " daddr
-  [[ -z "$daddr" ]] && daddr="127.0.0.1"
-
-  read -r -p "目标端口: " dport
-  [[ "$dport" =~ ^[0-9]+$ ]] || { warn "无效目标端口"; return 1; }
-
-  enable_ip_forwarding
-
-  iptables -t nat -A PREROUTING -p "$proto" --dport "$sport" -j DNAT --to-destination "${daddr}:${dport}" || return 1
-  if [[ "$daddr" != "127.0.0.1" ]]; then
-    iptables -A FORWARD -p "$proto" -d "$daddr" --dport "$dport" -j ACCEPT || return 1
-  fi
-  iptables -t nat -A POSTROUTING -p "$proto" -d "$daddr" --dport "$dport" -j MASQUERADE || return 1
-
-  save_iptables_rules || true
-  info "已添加转发：$sport -> $daddr:$dport"
-}
-
-delete_port_forwarding() {
-  echo -e "${BLUE}--- 删除端口转发 ---${NC}"
-  read -r -p "协议 (tcp/udp): " proto
-  read -r -p "源端口: " sport
-  read -r -p "目标IP(空=127.0.0.1): " daddr
-  [[ -z "$daddr" ]] && daddr="127.0.0.1"
-  read -r -p "目标端口: " dport
-
-  iptables -t nat -D PREROUTING -p "$proto" --dport "$sport" -j DNAT --to-destination "${daddr}:${dport}" 2>/dev/null || true
-  [[ "$daddr" != "127.0.0.1" ]] && iptables -D FORWARD -p "$proto" -d "$daddr" --dport "$dport" -j ACCEPT 2>/dev/null || true
-  iptables -t nat -D POSTROUTING -p "$proto" -d "$daddr" --dport "$dport" -j MASQUERADE 2>/dev/null || true
-
-  save_iptables_rules || true
-  info "已尝试删除转发：$sport -> $daddr:$dport"
-}
-
-view_port_forwarding() {
-  echo -e "${BLUE}--- 当前 NAT PREROUTING 规则 ---${NC}"
-  iptables -t nat -L PREROUTING -n -v --line-numbers
-}
-
-# ------------------ Docker 出网策略（DOCKER-USER） ------------------
+# ------------------ Docker / Caddy / sysctl / malware / 一键初始化（保持 v3.1.2 原逻辑） ------------------
 ensure_docker_user_chain() {
   iptables -nL DOCKER-USER >/dev/null 2>&1 || iptables -N DOCKER-USER
   iptables -C DOCKER-USER -j RETURN >/dev/null 2>&1 || iptables -A DOCKER-USER -j RETURN
@@ -1426,7 +1463,6 @@ docker_security_menu() {
   esac
 }
 
-# ------------------ Caddy 防扫描 snippet ------------------
 install_caddy_security() {
   echo -e "${BLUE}--- 生成 Caddy 防扫描规则片段 ---${NC}"
   mkdir -p /etc/caddy/snippets
@@ -1454,8 +1490,6 @@ install_caddy_security() {
     respond @bad_path 403
 }
 
-# 注意：rate_limit 指令通常需要对应 Caddy 模块支持；
-# 如果你的 Caddy 未包含该模块，请不要 import 下面 (rate_limit) 或自行删除它。
 (rate_limit) {
     rate_limit {
         zone global
@@ -1473,7 +1507,6 @@ EOF
   echo "  # import rate_limit  (若模块不支持请勿启用)"
 }
 
-# ------------------ sysctl 网络加固（幂等） ------------------
 harden_sysctl() {
   echo -e "${BLUE}--- sysctl 网络安全加固 ---${NC}"
   local marker_begin="# ---- v3.1.0 security hardening BEGIN ----"
@@ -1503,7 +1536,6 @@ EOF
   info "sysctl 加固已应用。"
 }
 
-# ------------------ 快速恶意进程检查 ------------------
 quick_malware_check() {
   echo -e "${BLUE}--- 快速恶意进程检查 ---${NC}"
   local out
@@ -1516,15 +1548,13 @@ quick_malware_check() {
   fi
 }
 
-# ------------------ 一键安全初始化 ------------------
+# ------------------ 一键安全初始化（已修改：SSH 步骤改为调用 ssh_baseline_init） ------------------
 security_init_full() {
-  echo -e "${BLUE}=== 一键安全初始化（v3.1.x-TOOLBOX）===${NC}"
-  echo -e "${YELLOW}将执行：SSH 安全基线（禁root+全局禁密码） + iptables 初始化 + Fail2Ban + sysctl 加固 + Docker 出网策略 + Caddy 防扫描${NC}"
+  echo -e "${BLUE}=== 一键安全初始化（v3.1.3-TOOLBOX-FINAL）===${NC}"
+  echo -e "${YELLOW}将执行：一键 SSH 基线 + iptables 初始化 + Fail2Ban + sysctl 加固 + Docker 出网策略 + Caddy 防扫描${NC}"
   confirm "确认继续？" || { echo "操作已取消。"; return; }
 
-  policy_state_set_global_password no
-  ssh_policy_apply || return 1
-
+  ssh_baseline_init || return 1
   enable_iptables || true
   install_fail2ban || true
   harden_sysctl || true
@@ -1547,23 +1577,25 @@ main() {
 
     clear
     echo "=============================================="
-    echo " VPS 高级管理脚本 v3.1.2-TOOLBOX-FINAL (分离版)"
+    echo " VPS 高级管理脚本 v3.1.3-TOOLBOX-FINAL (分离版)"
     echo "=============================================="
     echo " 1. 用户管理（账号：新增/删/改密码/sudo）"
     echo " 2. SSH 认证策略管理（仅密钥/密码/SFTP-only/多密钥/GitHub）"
     echo " 3. 修改 SSH 端口（显示生效端口）"
     echo "----------------------------------------------"
-    echo " 4. 启用并初始化 iptables 防火墙（保守/强制）"
-    echo " 5. 配置防火墙端口 (当前: $firewall_type)"
-    echo " 6. 查看当前防火墙规则 (当前: $firewall_type)"
-    echo " 7. 端口转发管理 (iptables)"
+    echo " 4. 一键 SSH 基线安全初始化（禁root/禁密码/端口${BASELINE_SSH_PORT}/${BASELINE_USER}）"
     echo "----------------------------------------------"
-    echo " 8. 安装并启用 Fail2Ban"
-    echo " 9. Docker 容器出网安全等级（DOCKER-USER / iptables）"
-    echo "10. 生成 Caddy 防扫描规则片段"
-    echo "11. sysctl 网络安全加固"
-    echo "12. 快速恶意进程检查"
-    echo "13. 一键安全初始化（推荐）"
+    echo " 5. 启用并初始化 iptables 防火墙（保守/强制）"
+    echo " 6. 配置防火墙端口 (当前: $firewall_type)"
+    echo " 7. 查看当前防火墙规则 (当前: $firewall_type)"
+    echo " 8. 端口转发管理 (iptables)"
+    echo "----------------------------------------------"
+    echo " 9. 安装并启用 Fail2Ban"
+    echo "10. Docker 容器出网安全等级（DOCKER-USER / iptables）"
+    echo "11. 生成 Caddy 防扫描规则片段"
+    echo "12. sysctl 网络安全加固"
+    echo "13. 快速恶意进程检查"
+    echo "14. 一键安全初始化（推荐）"
     echo " 0. 退出"
     echo "=============================================="
     read -r -p "请选择功能: " choice
@@ -1572,22 +1604,23 @@ main() {
       1) user_management ;;
       2) ssh_policy_menu ;;
       3) change_ssh_port ;;
-      4)
+      4) ssh_baseline_init ;;
+      5)
         if confirm "将配置 iptables（默认保守模式，不清空现有规则）。继续吗？"; then
           enable_iptables
         else
           echo "操作已取消。"
         fi
         ;;
-      5) configure_ports ;;
-      6) show_firewall_rules ;;
-      7) port_forwarding_menu ;;
-      8) install_fail2ban ;;
-      9) docker_security_menu ;;
-      10) install_caddy_security ;;
-      11) harden_sysctl ;;
-      12) quick_malware_check ;;
-      13) security_init_full ;;
+      6) configure_ports ;;
+      7) show_firewall_rules ;;
+      8) port_forwarding_menu ;;
+      9) install_fail2ban ;;
+      10) docker_security_menu ;;
+      11) install_caddy_security ;;
+      12) harden_sysctl ;;
+      13) quick_malware_check ;;
+      14) security_init_full ;;
       0) echo "退出脚本"; exit 0 ;;
       *) warn "无效的选择，请重试" ;;
     esac
