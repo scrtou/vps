@@ -1,12 +1,16 @@
 #!/bin/bash
 # =================================================================
-# VPS 高级管理脚本 v3.1.3-TOOLBOX-FINAL
+# VPS 高级管理脚本 v3.1.4-TOOLBOX-FINAL
+#
+# v3.1.4 新增/修改：
+# - 修复 VPS-BASELINE 链中 RETURN 后追加端口规则导致端口实际不生效的问题
+# - 配置防火墙端口支持多个端口、端口段、混合输入
+#   示例：60001 / 60001,60010 / 60001 60010 / 60001-60010 / 60001,60010-60020,65522
+# - iptables/ip6tables 开放端口时会自动插入到 VPS-BASELINE 的 RETURN 之前
 #
 # v3.1.3 新增/修改：
-# - ✅ 新增“一键 SSH 基线安全初始化”：
-#     禁 root 登录、禁密码登录、SSH 端口=65522、创建/更新 sshUser（sudo 密码 + 公钥）
-# - ✅ 修改“一键安全初始化”中的 SSH 基线步骤：改为调用上述基线函数
-# - ✅ 基线参数在脚本头部可改
+# - 新增“一键 SSH 基线安全初始化”
+# - 禁 root 登录、禁密码登录、SSH 端口=65522、创建/更新 sshUser（sudo 密码 + 公钥）
 # =================================================================
 
 set -uo pipefail
@@ -33,7 +37,6 @@ SYSCTL_CONFIG="/etc/sysctl.conf"
 VPSMGR_DIR="/etc/vpsmgr"
 SSH_POLICY_STATE="${VPSMGR_DIR}/ssh_policy.state"
 
-# 兼容旧版本 block（自动清理）
 OLD_POLICY_BEGIN="# === VPSMGR SSH POLICY BEGIN ==="
 OLD_POLICY_END="# === VPSMGR SSH POLICY END ==="
 OLD_GLOBAL_BEGIN="# === VPSMGR SSH GLOBAL BEGIN ==="
@@ -90,9 +93,9 @@ ensure_sudo_group_rule() {
   has_wheel_rule="$(grep -RIs --no-messages '^[[:space:]]*%wheel[[:space:]]' /etc/sudoers /etc/sudoers.d 2>/dev/null || true)"
 
   if getent group sudo >/dev/null 2>&1 && [[ -z "$has_sudo_rule" ]]; then
-    cat >/etc/sudoers.d/90-vpsmgr-sudo-group <<'EOF'
+    cat >/etc/sudoers.d/90-vpsmgr-sudo-group <<'EOSUDO'
 %sudo ALL=(ALL:ALL) ALL
-EOF
+EOSUDO
     chmod 0440 /etc/sudoers.d/90-vpsmgr-sudo-group
     visudo -cf /etc/sudoers >/dev/null 2>&1 || {
       rm -f /etc/sudoers.d/90-vpsmgr-sudo-group
@@ -102,9 +105,9 @@ EOF
   fi
 
   if getent group wheel >/dev/null 2>&1 && [[ -z "$has_wheel_rule" ]]; then
-    cat >/etc/sudoers.d/90-vpsmgr-wheel-group <<'EOF'
+    cat >/etc/sudoers.d/90-vpsmgr-wheel-group <<'EOWHEEL'
 %wheel ALL=(ALL) ALL
-EOF
+EOWHEEL
     chmod 0440 /etc/sudoers.d/90-vpsmgr-wheel-group
     visudo -cf /etc/sudoers >/dev/null 2>&1 || {
       rm -f /etc/sudoers.d/90-vpsmgr-wheel-group
@@ -114,7 +117,6 @@ EOF
   fi
 }
 
-# ===== sudo/wheel 组管理 =====
 detect_admin_group() {
   if getent group sudo >/dev/null 2>&1; then echo "sudo"
   elif getent group wheel >/dev/null 2>&1; then echo "wheel"
@@ -149,19 +151,17 @@ remove_user_from_admin_group() {
 
   if command -v gpasswd >/dev/null 2>&1; then
     gpasswd -d "$u" "$g" >/dev/null 2>&1 || { warn "移除失败（可能本来就不在 $g 组里）"; return 1; }
-    info "已将用户 $u 从 $g 组移除"
   elif command -v deluser >/dev/null 2>&1; then
     deluser "$u" "$g" >/dev/null 2>&1 || { warn "移除失败（可能本来就不在 $g 组里）"; return 1; }
-    info "已将用户 $u 从 $g 组移除"
   else
     local groups new_groups
     groups="$(id -nG "$u" 2>/dev/null || true)"
     [[ -n "$groups" ]] || { warn "无法获取用户组信息"; return 1; }
     new_groups="$(echo "$groups" | tr ' ' '\n' | awk -v rm="$g" '$0!=rm && $0!=""' | paste -sd, -)"
     usermod -G "${new_groups}" "$u" || { warn "移除失败（usermod -G）"; return 1; }
-    info "已将用户 $u 从 $g 组移除（usermod -G 兜底）"
   fi
 
+  info "已将用户 $u 从 $g 组移除"
   warn "提示：移除组后需要退出并重新登录一次才能在会话中生效。"
 }
 
@@ -273,7 +273,7 @@ ssh_backup_config() {
 policy_state_init() {
   ensure_vpsmgr_dir
   [[ -f "$SSH_POLICY_STATE" ]] || {
-    cat >"$SSH_POLICY_STATE" <<EOF
+    cat >"$SSH_POLICY_STATE" <<EOSTATE
 # format:
 # GLOBAL_PASSWORD=no|yes   (可选，不写则不改全局默认)
 # USER:username:mode[:arg]
@@ -281,7 +281,7 @@ policy_state_init() {
 #   keyonly
 #   password
 #   sftp_password:/sftp/username
-EOF
+EOSTATE
     chmod 600 "$SSH_POLICY_STATE"
   }
 }
@@ -484,7 +484,7 @@ setup_sftp_chroot_for_user() {
   info "已设置 SFTP chroot：${rootdir}（上传目录：${upload}）"
 }
 
-# ------------------ SSH 策略落地到 /etc/ssh/sshd_config.d/99-vpsmgr.conf ------------------
+# ------------------ SSH 策略落地 ------------------
 sshd_supports_include_dir() {
   grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$SSHD_CONFIG" && [[ -d "$SSHD_CONF_DIR" ]]
 }
@@ -493,7 +493,6 @@ cleanup_legacy_blocks_in_sshd_config() {
   sed -i "/^${OLD_POLICY_BEGIN}$/,/^${OLD_POLICY_END}$/d" "$SSHD_CONFIG" 2>/dev/null || true
   sed -i "/^${OLD_GLOBAL_BEGIN}$/,/^${OLD_GLOBAL_END}$/d" "$SSHD_CONFIG" 2>/dev/null || true
   sed -i "/^${OLD_USER_BEGIN}$/,/^${OLD_USER_END}$/d" "$SSHD_CONFIG" 2>/dev/null || true
-  # 关键：清掉所有非注释 PermitRootLogin（避免默认 prohibit-password 抢回）
   sed -i -E '/^[[:space:]]*PermitRootLogin[[:space:]]+/d' "$SSHD_CONFIG" 2>/dev/null || true
 }
 
@@ -541,9 +540,7 @@ write_vpsmgr_conf_from_state() {
           echo "    X11Forwarding no"
           echo "    AllowTcpForwarding no"
           ;;
-        *)
-          echo "    # unknown mode: $mode (ignored)"
-          ;;
+        *) echo "    # unknown mode: $mode (ignored)" ;;
       esac
     done
     echo ""
@@ -596,6 +593,81 @@ ssh_policy_clear_all() {
 }
 
 # ------------------ iptables / firewall ------------------
+normalize_ports_input() {
+  local input="$1"
+  local token start end p
+  local result=""
+
+  input="$(echo "$input" | tr '，' ',' | tr ',' ' ')"
+
+  for token in $input; do
+    if [[ "$token" =~ ^[0-9]+$ ]]; then
+      if [ "$token" -lt 1 ] || [ "$token" -gt 65535 ]; then
+        warn "无效端口号：$token"
+        return 1
+      fi
+      result+="$token"$'\n'
+    elif [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      start="${BASH_REMATCH[1]}"
+      end="${BASH_REMATCH[2]}"
+      if [ "$start" -lt 1 ] || [ "$start" -gt 65535 ] || [ "$end" -lt 1 ] || [ "$end" -gt 65535 ] || [ "$start" -gt "$end" ]; then
+        warn "无效端口段：$token"
+        return 1
+      fi
+      for ((p=start; p<=end; p++)); do
+        result+="$p"$'\n'
+      done
+    else
+      warn "端口格式无效：$token"
+      return 1
+    fi
+  done
+
+  echo "$result" | awk 'NF' | sort -n -u
+}
+
+iptables_chain_exists() {
+  local bin="$1" chain="$2"
+  command -v "$bin" >/dev/null 2>&1 || return 1
+  "$bin" -nL "$chain" >/dev/null 2>&1
+}
+
+iptables_pick_chain() {
+  local bin="$1"
+  if iptables_chain_exists "$bin" "VPS-BASELINE"; then
+    echo "VPS-BASELINE"
+  else
+    echo "INPUT"
+  fi
+}
+
+iptables_insert_before_return() {
+  local bin="$1" chain="$2" proto="$3" port="$4"
+  command -v "$bin" >/dev/null 2>&1 || return 0
+
+  if "$bin" -C "$chain" -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+    return 0
+  fi
+
+  local return_line
+  return_line="$("$bin" -L "$chain" -n --line-numbers 2>/dev/null | awk '$2=="RETURN"{print $1; exit}')"
+
+  if [[ -n "$return_line" ]]; then
+    "$bin" -I "$chain" "$return_line" -p "$proto" --dport "$port" -j ACCEPT
+  else
+    "$bin" -A "$chain" -p "$proto" --dport "$port" -j ACCEPT
+  fi
+}
+
+iptables_delete_accept_rule() {
+  local bin="$1" chain="$2" proto="$3" port="$4"
+  command -v "$bin" >/dev/null 2>&1 || return 0
+
+  while "$bin" -C "$chain" -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; do
+    "$bin" -D "$chain" -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || break
+  done
+}
+
 check_and_install_iptables() {
   command -v iptables &>/dev/null && return 0
   warn "检测到 iptables 未安装，正在尝试自动安装..."
@@ -769,67 +841,110 @@ enable_iptables() {
 }
 
 configure_ports() {
-  local firewall; firewall="$(detect_firewall)"
+  local firewall
+  firewall="$(detect_firewall)"
   [[ "$firewall" != "none" ]] || { warn "未检测到可用防火墙（iptables/ufw/firewalld）"; return 1; }
 
   echo "===== 配置防火墙端口 (当前: $firewall) ====="
   echo "1. 开放端口"
   echo "2. 关闭端口"
   read -r -p "请选择操作: " action
-  read -r -p "请输入端口号: " port
-  if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-    warn "无效端口号"
+
+  if [[ "$action" != "1" && "$action" != "2" ]]; then
+    warn "无效操作"
     return 1
   fi
+
+  echo ""
+  echo "端口输入支持：单个端口、多个端口、端口段、混合输入。"
+  echo "示例："
+  echo "  60001"
+  echo "  60001,60010,65522"
+  echo "  60001 60010 65522"
+  echo "  60001-60010"
+  echo "  60001,60010-60020,65522"
+  echo ""
+  read -r -p "请输入端口/多个端口/端口段: " ports_input
+
+  local ports
+  ports="$(normalize_ports_input "$ports_input")" || return 1
+  [[ -n "$ports" ]] || { warn "未输入有效端口"; return 1; }
+
   read -r -p "选择协议 (tcp/udp/both): " protocol
   if [[ "$protocol" != "tcp" && "$protocol" != "udp" && "$protocol" != "both" ]]; then
     warn "无效协议"
     return 1
   fi
 
+  local op_text
+  if [[ "$action" == "1" ]]; then op_text="开放"; else op_text="关闭"; fi
+
   if [[ "$firewall" == "iptables" ]]; then
-    local rule_action="-A" op_text="开放"
-    [[ "$action" == "2" ]] && rule_action="-D" && op_text="关闭"
+    check_and_install_iptables || return 1
 
-    local chain="INPUT"
-    iptables -nL VPS-BASELINE >/dev/null 2>&1 && chain="VPS-BASELINE"
+    local chain ip6_chain port
+    chain="$(iptables_pick_chain iptables)"
 
-    if [[ "$protocol" == "tcp" || "$protocol" == "both" ]]; then
-      iptables "$rule_action" "$chain" -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
-      command -v ip6tables &>/dev/null && ip6tables "$rule_action" "$chain" -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
-      info "iptables: 已${op_text} TCP 端口 $port"
+    if command -v ip6tables >/dev/null 2>&1; then
+      ip6_chain="$(iptables_pick_chain ip6tables)"
+    else
+      ip6_chain=""
     fi
-    if [[ "$protocol" == "udp" || "$protocol" == "both" ]]; then
-      iptables "$rule_action" "$chain" -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
-      command -v ip6tables &>/dev/null && ip6tables "$rule_action" "$chain" -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
-      info "iptables: 已${op_text} UDP 端口 $port"
-    fi
-    save_iptables_rules || true
-  elif [[ "$firewall" == "ufw" ]]; then
-    local proto_list=()
-    [[ "$protocol" == "tcp" || "$protocol" == "both" ]] && proto_list+=("tcp")
-    [[ "$protocol" == "udp" || "$protocol" == "both" ]] && proto_list+=("udp")
-    for p in "${proto_list[@]}"; do
+
+    while read -r port; do
+      [[ -z "$port" ]] && continue
+
       if [[ "$action" == "1" ]]; then
-        ufw allow "${port}/${p}" >/dev/null 2>&1 || true
-        info "ufw: 已开放 ${port}/${p}"
+        if [[ "$protocol" == "tcp" || "$protocol" == "both" ]]; then
+          iptables_insert_before_return iptables "$chain" tcp "$port" || warn "IPv4 TCP $port 开放失败"
+          [[ -n "$ip6_chain" ]] && iptables_insert_before_return ip6tables "$ip6_chain" tcp "$port" || true
+        fi
+        if [[ "$protocol" == "udp" || "$protocol" == "both" ]]; then
+          iptables_insert_before_return iptables "$chain" udp "$port" || warn "IPv4 UDP $port 开放失败"
+          [[ -n "$ip6_chain" ]] && iptables_insert_before_return ip6tables "$ip6_chain" udp "$port" || true
+        fi
       else
-        ufw delete allow "${port}/${p}" >/dev/null 2>&1 || true
-        info "ufw: 已关闭 ${port}/${p}"
+        if [[ "$protocol" == "tcp" || "$protocol" == "both" ]]; then
+          iptables_delete_accept_rule iptables "$chain" tcp "$port"
+          [[ -n "$ip6_chain" ]] && iptables_delete_accept_rule ip6tables "$ip6_chain" tcp "$port" || true
+        fi
+        if [[ "$protocol" == "udp" || "$protocol" == "both" ]]; then
+          iptables_delete_accept_rule iptables "$chain" udp "$port"
+          [[ -n "$ip6_chain" ]] && iptables_delete_accept_rule ip6tables "$ip6_chain" udp "$port" || true
+        fi
       fi
-    done
+    done <<< "$ports"
+
+    save_iptables_rules || true
+    echo -e "${GREEN}iptables: 已${op_text}以下端口（协议：${protocol}）：${NC}"
+    echo "$ports" | paste -sd, -
+    echo -e "${YELLOW}提示：若使用 VPS-BASELINE 链，规则已自动插入到 RETURN 前面。${NC}"
+
+  elif [[ "$firewall" == "ufw" ]]; then
+    local port
+    while read -r port; do
+      [[ -z "$port" ]] && continue
+      if [[ "$protocol" == "tcp" || "$protocol" == "both" ]]; then
+        if [[ "$action" == "1" ]]; then ufw allow "${port}/tcp" >/dev/null 2>&1 || true; else ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true; fi
+      fi
+      if [[ "$protocol" == "udp" || "$protocol" == "both" ]]; then
+        if [[ "$action" == "1" ]]; then ufw allow "${port}/udp" >/dev/null 2>&1 || true; else ufw delete allow "${port}/udp" >/dev/null 2>&1 || true; fi
+      fi
+    done <<< "$ports"
+    echo -e "${GREEN}ufw: 已${op_text}以下端口（协议：${protocol}）：${NC}"
+    echo "$ports" | paste -sd, -
+
   elif [[ "$firewall" == "firewalld" ]]; then
-    local op="--add-port" op_text="开放"
-    [[ "$action" == "2" ]] && op="--remove-port" && op_text="关闭"
-    if [[ "$protocol" == "tcp" || "$protocol" == "both" ]]; then
-      firewall-cmd --permanent "$op=${port}/tcp" >/dev/null 2>&1 || true
-      info "firewalld: 已${op_text} ${port}/tcp"
-    fi
-    if [[ "$protocol" == "udp" || "$protocol" == "both" ]]; then
-      firewall-cmd --permanent "$op=${port}/udp" >/dev/null 2>&1 || true
-      info "firewalld: 已${op_text} ${port}/udp"
-    fi
+    local port op
+    if [[ "$action" == "1" ]]; then op="--add-port"; else op="--remove-port"; fi
+    while read -r port; do
+      [[ -z "$port" ]] && continue
+      [[ "$protocol" == "tcp" || "$protocol" == "both" ]] && firewall-cmd --permanent "${op}=${port}/tcp" >/dev/null 2>&1 || true
+      [[ "$protocol" == "udp" || "$protocol" == "both" ]] && firewall-cmd --permanent "${op}=${port}/udp" >/dev/null 2>&1 || true
+    done <<< "$ports"
     firewall-cmd --reload >/dev/null 2>&1 || true
+    echo -e "${GREEN}firewalld: 已${op_text}以下端口（协议：${protocol}）：${NC}"
+    echo "$ports" | paste -sd, -
   fi
 }
 
@@ -889,24 +1004,19 @@ add_port_forwarding() {
   echo -e "${BLUE}--- 添加端口转发 ---${NC}"
   read -r -p "协议 (tcp/udp): " proto
   [[ "$proto" == "tcp" || "$proto" == "udp" ]] || { warn "无效协议"; return 1; }
-
   read -r -p "源端口: " sport
   [[ "$sport" =~ ^[0-9]+$ ]] || { warn "无效源端口"; return 1; }
-
   read -r -p "目标IP(空=127.0.0.1): " daddr
   [[ -z "$daddr" ]] && daddr="127.0.0.1"
-
   read -r -p "目标端口: " dport
   [[ "$dport" =~ ^[0-9]+$ ]] || { warn "无效目标端口"; return 1; }
 
   enable_ip_forwarding
-
   iptables -t nat -A PREROUTING -p "$proto" --dport "$sport" -j DNAT --to-destination "${daddr}:${dport}" || return 1
   if [[ "$daddr" != "127.0.0.1" ]]; then
     iptables -A FORWARD -p "$proto" -d "$daddr" --dport "$dport" -j ACCEPT || return 1
   fi
   iptables -t nat -A POSTROUTING -p "$proto" -d "$daddr" --dport "$dport" -j MASQUERADE || return 1
-
   save_iptables_rules || true
   info "已添加转发：$sport -> $daddr:$dport"
 }
@@ -918,11 +1028,9 @@ delete_port_forwarding() {
   read -r -p "目标IP(空=127.0.0.1): " daddr
   [[ -z "$daddr" ]] && daddr="127.0.0.1"
   read -r -p "目标端口: " dport
-
   iptables -t nat -D PREROUTING -p "$proto" --dport "$sport" -j DNAT --to-destination "${daddr}:${dport}" 2>/dev/null || true
   [[ "$daddr" != "127.0.0.1" ]] && iptables -D FORWARD -p "$proto" -d "$daddr" --dport "$dport" -j ACCEPT 2>/dev/null || true
   iptables -t nat -D POSTROUTING -p "$proto" -d "$daddr" --dport "$dport" -j MASQUERADE 2>/dev/null || true
-
   save_iptables_rules || true
   info "已尝试删除转发：$sport -> $daddr:$dport"
 }
@@ -932,22 +1040,15 @@ view_port_forwarding() {
   iptables -t nat -L PREROUTING -n -v --line-numbers
 }
 
-# ------------------ Fail2Ban（安装/启用） ------------------
+# ------------------ Fail2Ban ------------------
 fail2ban_backend_detect() {
-  if command -v systemctl >/dev/null 2>&1 && command -v journalctl >/dev/null 2>&1; then
-    echo "systemd"
-  else
-    echo "auto"
-  fi
+  if command -v systemctl >/dev/null 2>&1 && command -v journalctl >/dev/null 2>&1; then echo "systemd"; else echo "auto"; fi
 }
 
 install_fail2ban() {
   echo -e "${BLUE}--- 安装并启用 Fail2Ban ---${NC}"
   case "$(detect_pkg_mgr)" in
-    apt)
-      apt-get update >/dev/null 2>&1
-      DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban >/dev/null 2>&1
-      ;;
+    apt) apt-get update >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban >/dev/null 2>&1 ;;
     dnf) dnf install -y fail2ban ;;
     yum) yum install -y fail2ban ;;
     *) warn "无法识别包管理器，Fail2Ban 安装失败。"; return 1 ;;
@@ -957,7 +1058,7 @@ install_fail2ban() {
   ssh_port="$(get_effective_ssh_port)"
   backend="$(fail2ban_backend_detect)"
 
-  cat >/etc/fail2ban/jail.local <<EOF
+  cat >/etc/fail2ban/jail.local <<EOFAIL2BAN
 [DEFAULT]
 bantime  = 1h
 findtime = 10m
@@ -968,7 +1069,7 @@ ignoreip = 127.0.0.1/8
 [sshd]
 enabled  = true
 port     = ${ssh_port}
-EOF
+EOFAIL2BAN
 
   systemctl enable fail2ban --now >/dev/null 2>&1 || true
   if systemctl is-active --quiet fail2ban 2>/dev/null; then
@@ -984,27 +1085,10 @@ update_fail2ban_port_if_present() {
   [[ -f "$jail" ]] || return 0
   grep -q '^\[sshd\]' "$jail" || return 0
 
-  if awk '
-    BEGIN{in_sshd=0; found=0}
-    /^\[sshd\]/{in_sshd=1; next}
-    /^\[/{in_sshd=0}
-    { if(in_sshd && $0 ~ /^port[[:space:]]*=/) found=1 }
-    END{ exit(found?0:1) }
-  ' "$jail"; then
-    awk -v p="$new_port" '
-      BEGIN{in_sshd=0}
-      /^\[sshd\]/{in_sshd=1; print; next}
-      /^\[/{ if(in_sshd){in_sshd=0} print; next}
-      {
-        if(in_sshd && $0 ~ /^port[[:space:]]*=/){print "port     = " p; next}
-        print
-      }
-    ' "$jail" > "${jail}.tmp" && mv "${jail}.tmp" "$jail"
+  if awk 'BEGIN{in_sshd=0; found=0} /^\[sshd\]/{in_sshd=1; next} /^\[/{in_sshd=0} { if(in_sshd && $0 ~ /^port[[:space:]]*=/) found=1 } END{ exit(found?0:1) }' "$jail"; then
+    awk -v p="$new_port" 'BEGIN{in_sshd=0} /^\[sshd\]/{in_sshd=1; print; next} /^\[/{ if(in_sshd){in_sshd=0} print; next} { if(in_sshd && $0 ~ /^port[[:space:]]*=/){print "port     = " p; next} print }' "$jail" > "${jail}.tmp" && mv "${jail}.tmp" "$jail"
   else
-    awk -v p="$new_port" '
-      /^\[sshd\]/{print; print "port     = " p; next}
-      {print}
-    ' "$jail" > "${jail}.tmp" && mv "${jail}.tmp" "$jail"
+    awk -v p="$new_port" '/^\[sshd\]/{print; print "port     = " p; next} {print}' "$jail" > "${jail}.tmp" && mv "${jail}.tmp" "$jail"
   fi
 
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet fail2ban 2>/dev/null; then
@@ -1014,19 +1098,17 @@ update_fail2ban_port_if_present() {
   fi
 }
 
-# ------------------ SSH 端口修改（交互） ------------------
+# ------------------ SSH 端口修改 ------------------
 change_ssh_port() {
   echo -e "${BLUE}--- 修改 SSH 端口 ---${NC}"
   local old_port; old_port="$(get_effective_ssh_port)"
   echo -e "${GREEN}当前 SSH 生效端口：${old_port}${NC}"
   echo -e "${GREEN}当前 sshd_config 中 Port 行：${NC}"
   grep -nE "^\s*#?\s*Port\s+" "$SSHD_CONFIG" || true
-
   read -r -p "请输入新的SSH端口号 (1-65535): " new_port
   set_ssh_port_noninteractive "$new_port"
 }
 
-# ------------------ SSH 端口修改（非交互：供“一键基线”调用） ------------------
 set_ssh_port_noninteractive() {
   local new_port="${1:-}"
   if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
@@ -1039,22 +1121,10 @@ set_ssh_port_noninteractive() {
   [[ "$old_port" == "$new_port" ]] && { info "SSH 端口已是 $new_port，无需修改"; return 0; }
 
   backup_file="$(ssh_backup_config)"
-
-  # 删除所有 Port 行，避免重复；插入到第一个 Match 之前
   sed -i -E '/^\s*#?\s*Port\s+[0-9]+/d' "$SSHD_CONFIG" 2>/dev/null || true
 
   local tmpout; tmpout="$(mktemp)"
-  awk -v P="Port ${new_port}" '
-    BEGIN{inserted=0}
-    {
-      if(!inserted && $0 ~ /^[[:space:]]*Match[[:space:]]+/){
-        print P
-        inserted=1
-      }
-      print
-    }
-    END{ if(!inserted) print P }
-  ' "$SSHD_CONFIG" > "$tmpout" && mv "$tmpout" "$SSHD_CONFIG"
+  awk -v P="Port ${new_port}" 'BEGIN{inserted=0} { if(!inserted && $0 ~ /^[[:space:]]*Match[[:space:]]+/){ print P; inserted=1 } print } END{ if(!inserted) print P }' "$SSHD_CONFIG" > "$tmpout" && mv "$tmpout" "$SSHD_CONFIG"
 
   warn "正在测试 SSH 配置..."
   if ! sshd_test_config; then
@@ -1063,24 +1133,18 @@ set_ssh_port_noninteractive() {
     return 1
   fi
 
-  # 防火墙放行（iptables/ufw/firewalld）
   local firewall_type; firewall_type="$(detect_firewall)"
   if [[ "$firewall_type" == "iptables" ]] && command -v iptables &>/dev/null; then
     echo "正在为 iptables 添加新端口规则..."
-    if iptables -nL VPS-BASELINE >/dev/null 2>&1; then
-      iptables -D VPS-BASELINE -p tcp --dport "$old_port" -j ACCEPT 2>/dev/null || true
-      iptables -I VPS-BASELINE 1 -p tcp --dport "$new_port" -j ACCEPT 2>/dev/null || iptables -A VPS-BASELINE -p tcp --dport "$new_port" -j ACCEPT
-    else
-      iptables -I INPUT 1 -p tcp --dport "$new_port" -j ACCEPT 2>/dev/null || true
+    local chain ip6_chain
+    chain="$(iptables_pick_chain iptables)"
+    iptables_delete_accept_rule iptables "$chain" tcp "$old_port" || true
+    iptables_insert_before_return iptables "$chain" tcp "$new_port" || true
+    if command -v ip6tables &>/dev/null; then
+      ip6_chain="$(iptables_pick_chain ip6tables)"
+      iptables_delete_accept_rule ip6tables "$ip6_chain" tcp "$old_port" || true
+      iptables_insert_before_return ip6tables "$ip6_chain" tcp "$new_port" || true
     fi
-    command -v ip6tables &>/dev/null && {
-      if ip6tables -nL VPS-BASELINE >/dev/null 2>&1; then
-        ip6tables -D VPS-BASELINE -p tcp --dport "$old_port" -j ACCEPT 2>/dev/null || true
-        ip6tables -I VPS-BASELINE 1 -p tcp --dport "$new_port" -j ACCEPT 2>/dev/null || ip6tables -A VPS-BASELINE -p tcp --dport "$new_port" -j ACCEPT
-      else
-        ip6tables -I INPUT 1 -p tcp --dport "$new_port" -j ACCEPT 2>/dev/null || true
-      fi
-    } || true
     save_iptables_rules || true
   elif [[ "$firewall_type" == "ufw" ]]; then
     ufw allow "${new_port}/tcp" >/dev/null 2>&1 || true
@@ -1102,11 +1166,9 @@ set_ssh_port_noninteractive() {
   fi
 }
 
-# ------------------ 一键 SSH 基线安全初始化（新增） ------------------
+# ------------------ 一键 SSH 基线安全初始化 ------------------
 ensure_baseline_user() {
   local u="$1" pass="$2" pubkey="$3"
-
-  # 1) 创建/确保用户存在
   if ! id "$u" &>/dev/null; then
     useradd -m -s /bin/bash "$u" || die "创建用户失败：$u"
     info "已创建用户：$u"
@@ -1114,7 +1176,6 @@ ensure_baseline_user() {
     info "用户已存在：$u（将更新密码/公钥/组）"
   fi
 
-  # 2) 设置密码（用于 sudo）
   if command -v chpasswd >/dev/null 2>&1; then
     printf '%s:%s\n' "$u" "$pass" | chpasswd || die "设置用户密码失败：$u"
     info "已更新密码：$u"
@@ -1122,10 +1183,7 @@ ensure_baseline_user() {
     die "未找到 chpasswd，无法非交互设置密码"
   fi
 
-  # 3) 加入 sudo/wheel
   add_user_to_admin_group "$u" || true
-
-  # 4) 写入公钥
   append_keys_to_user "$u" "$pubkey"
 }
 
@@ -1143,16 +1201,10 @@ ssh_baseline_init() {
 
   policy_state_init
   ensure_sudo_group_rule || true
-
-  # 先创建/更新用户与密钥，避免锁死
   ensure_baseline_user "$BASELINE_USER" "$BASELINE_USER_PASS" "$BASELINE_USER_PUBKEY"
-
-  # 应用 SSH 策略：禁 root、禁密码；并强制该用户 keyonly
   policy_state_set_global_password no
   policy_state_set_user "$BASELINE_USER" "keyonly"
   ssh_policy_apply || return 1
-
-  # 修改端口到基线端口
   set_ssh_port_noninteractive "$BASELINE_SSH_PORT" || return 1
 
   info "SSH 基线初始化完成。"
@@ -1160,7 +1212,7 @@ ssh_baseline_init() {
   echo "  ssh -p ${BASELINE_SSH_PORT} ${BASELINE_USER}@<你的服务器IP>"
 }
 
-# ------------------ 用户管理（只管账号，不改 SSH 策略） ------------------
+# ------------------ 用户管理 ------------------
 user_management() {
   while true; do
     echo -e "\n===== 用户管理（只管账号，不改 SSH 策略）====="
@@ -1192,25 +1244,12 @@ user_management() {
 
 add_user() {
   read -r -p "请输入新用户名: " username
-  if ! [[ "$username" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
-    warn "用户名格式不合法"
-    return 1
-  fi
+  if ! [[ "$username" =~ ^[a-z_][a-z0-9_-]*$ ]]; then warn "用户名格式不合法"; return 1; fi
   id "$username" &>/dev/null && { warn "用户已存在"; return 1; }
-
   useradd -m -s /bin/bash "$username"
   info "用户 $username 创建成功（仅账号，不含 SSH 策略）"
-
-  if confirm "是否现在为 $username 设置系统密码（用于本机登录/SSH密码/ sudo）？"; then
-    passwd "$username"
-  else
-    warn "未设置密码。若未来要允许 SSH 密码登录或 SFTP-only+密码，请先设置密码。"
-  fi
-
-  if confirm "是否将用户 $username 添加到 sudo/wheel 组？"; then
-    add_user_to_admin_group "$username" || true
-  fi
-
+  if confirm "是否现在为 $username 设置系统密码（用于本机登录/SSH密码/ sudo）？"; then passwd "$username"; else warn "未设置密码。若未来要允许 SSH 密码登录或 SFTP-only+密码，请先设置密码。"; fi
+  if confirm "是否将用户 $username 添加到 sudo/wheel 组？"; then add_user_to_admin_group "$username" || true; fi
   warn "下一步：到主菜单【2. SSH 认证策略管理】设置登录策略，并可导入多密钥/从 GitHub 拉取。"
 }
 
@@ -1224,23 +1263,11 @@ change_user_password() {
 delete_user() {
   read -r -p "请输入要删除的用户名: " username
   id "$username" &>/dev/null || { warn "用户不存在"; return 1; }
-
-  local uid
-  uid=$(id -u "$username")
-  if [ "$uid" -lt 1000 ] && [ "$uid" -ne 0 ]; then
-    warn "禁止删除 UID<1000 的系统用户"
-    return 1
-  fi
+  local uid; uid=$(id -u "$username")
+  if [ "$uid" -lt 1000 ] && [ "$uid" -ne 0 ]; then warn "禁止删除 UID<1000 的系统用户"; return 1; fi
   [ "$username" == "root" ] && { warn "禁止删除 root 用户"; return 1; }
-
   if confirm "确定删除用户 $username 吗？"; then
-    if confirm "是否同时删除 /home/$username？"; then
-      userdel -r "$username"
-      info "用户及主目录已删除"
-    else
-      userdel "$username"
-      info "用户已删除（主目录保留）"
-    fi
+    if confirm "是否同时删除 /home/$username？"; then userdel -r "$username"; info "用户及主目录已删除"; else userdel "$username"; info "用户已删除（主目录保留）"; fi
     policy_state_remove_user "$username" >/dev/null 2>&1 || true
     ssh_policy_apply >/dev/null 2>&1 || true
   else
@@ -1253,7 +1280,7 @@ list_users() {
   awk -F: '$3 >= 1000 && $1 != "nobody" {print $1 " (UID: " $3 ")"}' /etc/passwd
 }
 
-# ------------------ SSH 策略菜单（账号/策略分离） ------------------
+# ------------------ SSH 策略菜单 ------------------
 ssh_policy_menu() {
   policy_state_init
   while true; do
@@ -1270,40 +1297,24 @@ ssh_policy_menu() {
     echo "0. 返回主菜单"
     echo "============================================"
     read -r -p "请选择: " c
-
     case "$c" in
-      1)
-        policy_state_set_global_password no
-        ssh_policy_apply
-        ;;
+      1) policy_state_set_global_password no; ssh_policy_apply ;;
       2)
         echo "a) 全局允许密码   b) 全局禁止密码   c) 保持系统默认（不设置）"
         read -r -p "请选择(a/b/c): " g
-        case "$g" in
-          a) policy_state_set_global_password yes ;;
-          b) policy_state_set_global_password no ;;
-          c) policy_state_set_global_password clear ;;
-          *) warn "无效选择"; continue ;;
-        esac
-        ssh_policy_apply
-        ;;
+        case "$g" in a) policy_state_set_global_password yes ;; b) policy_state_set_global_password no ;; c) policy_state_set_global_password clear ;; *) warn "无效选择"; continue ;; esac
+        ssh_policy_apply ;;
       3)
         read -r -p "用户名: " u
         id "$u" &>/dev/null || { warn "用户不存在，请先在【用户管理】创建"; continue; }
         warn "仅密钥登录前，建议先确保该用户已有公钥（选项7可导入/追加多密钥）。"
-        if confirm "是否现在导入/追加该用户公钥？"; then
-          import_pubkeys_interactive "$u" "append" || continue
-        fi
-        policy_state_set_user "$u" "keyonly"
-        ssh_policy_apply
-        ;;
+        if confirm "是否现在导入/追加该用户公钥？"; then import_pubkeys_interactive "$u" "append" || continue; fi
+        policy_state_set_user "$u" "keyonly"; ssh_policy_apply ;;
       4)
         read -r -p "用户名: " u
         id "$u" &>/dev/null || { warn "用户不存在，请先在【用户管理】创建"; continue; }
         warn "此项仅允许 SSH 密码认证，不负责设置系统密码；请到【用户管理->修改用户密码】设置。"
-        policy_state_set_user "$u" "password"
-        ssh_policy_apply
-        ;;
+        policy_state_set_user "$u" "password"; ssh_policy_apply ;;
       5)
         read -r -p "用户名(建议 tempuser): " u
         id "$u" &>/dev/null || { warn "用户不存在，请先在【用户管理】创建"; continue; }
@@ -1311,17 +1322,9 @@ ssh_policy_menu() {
         [[ -z "$rootdir" ]] && rootdir="/sftp/${u}"
         setup_sftp_chroot_for_user "$u" "$rootdir" || continue
         warn "请确保该用户已设置系统密码（用户管理->修改密码），否则无法用密码 SFTP。"
-        policy_state_set_user "$u" "sftp_password" "$rootdir"
-        ssh_policy_apply
-        ;;
-      6)
-        read -r -p "用户名: " u
-        policy_state_remove_user "$u"
-        ssh_policy_apply
-        ;;
-      7)
-        manage_user_keys_menu
-        ;;
+        policy_state_set_user "$u" "sftp_password" "$rootdir"; ssh_policy_apply ;;
+      6) read -r -p "用户名: " u; policy_state_remove_user "$u"; ssh_policy_apply ;;
+      7) manage_user_keys_menu ;;
       8)
         policy_state_show
         echo -e "${GREEN}--- sshd 最终生效关键项（sshd -T）---${NC}"
@@ -1330,23 +1333,15 @@ ssh_policy_menu() {
         echo "passwordauth:      $(get_effective_sshd_value passwordauthentication)"
         echo "kbdinteractive:    $(get_effective_sshd_value kbdinteractiveauthentication)"
         echo "pubkeyauth:        $(get_effective_sshd_value pubkeyauthentication)"
-        if [[ -f "$SSHD_VPSMGR_CONF" ]]; then
-          echo -e "${GREEN}--- ${SSHD_VPSMGR_CONF}（当前生效文件）---${NC}"
-          sed -n '1,220p' "$SSHD_VPSMGR_CONF"
-        else
-          warn "99-vpsmgr.conf 不存在（尚未应用策略或已清理）"
-        fi
-        ;;
-      9)
-        confirm "确认清理全部 SSH 策略？" && ssh_policy_clear_all
-        ;;
+        if [[ -f "$SSHD_VPSMGR_CONF" ]]; then echo -e "${GREEN}--- ${SSHD_VPSMGR_CONF}（当前生效文件）---${NC}"; sed -n '1,220p' "$SSHD_VPSMGR_CONF"; else warn "99-vpsmgr.conf 不存在（尚未应用策略或已清理）"; fi ;;
+      9) confirm "确认清理全部 SSH 策略？" && ssh_policy_clear_all ;;
       0) break ;;
       *) warn "无效选择" ;;
     esac
   done
 }
 
-# ------------------ Docker / Caddy / sysctl / malware / 一键初始化（保持 v3.1.2 原逻辑） ------------------
+# ------------------ Docker / Caddy / sysctl / malware ------------------
 ensure_docker_user_chain() {
   iptables -nL DOCKER-USER >/dev/null 2>&1 || iptables -N DOCKER-USER
   iptables -C DOCKER-USER -j RETURN >/dev/null 2>&1 || iptables -A DOCKER-USER -j RETURN
@@ -1362,10 +1357,7 @@ get_docker_subnets() {
 docker_egress_clear_managed_rules() {
   local rules
   rules="$(iptables -S DOCKER-USER 2>/dev/null | grep 'VPSMGR_DOCKER_EGRESS' || true)"
-  if [[ -z "$rules" ]]; then
-    warn "未发现可清理的 VPSMGR Docker 出网规则。"
-    return 0
-  fi
+  if [[ -z "$rules" ]]; then warn "未发现可清理的 VPSMGR Docker 出网规则。"; return 0; fi
   echo "$rules" | sed 's/^-A /-D /' | while read -r line; do
     # shellcheck disable=SC2086
     iptables $line 2>/dev/null || true
@@ -1377,17 +1369,9 @@ docker_security_menu() {
   echo -e "${BLUE}--- Docker 容器出网安全等级（iptables / DOCKER-USER）---${NC}"
   check_and_install_iptables || return 1
   command -v docker >/dev/null 2>&1 || { warn "未检测到 docker 命令，取消。"; return 1; }
-
   ensure_docker_user_chain
-
   local subnets; subnets="$(get_docker_subnets)"
-  if [[ -z "$subnets" ]]; then
-    warn "未检测到 Docker 子网（docker network inspect 无输出）。仍可用“自定义子网”。"
-  else
-    info "检测到 Docker 子网："
-    echo "$subnets" | sed 's/^/  - /'
-  fi
-
+  if [[ -z "$subnets" ]]; then warn "未检测到 Docker 子网（docker network inspect 无输出）。仍可用“自定义子网”。"; else info "检测到 Docker 子网："; echo "$subnets" | sed 's/^/  - /'; fi
   warn "说明：在 DOCKER-USER 链限制容器发起 NEW 连接的出网行为，较不易被 Docker 规则重排影响。"
   echo "1. 仅允许 80/443 出网（推荐）"
   echo "2. 完全禁止容器发起 NEW 出网（最严格）"
@@ -1396,66 +1380,42 @@ docker_security_menu() {
   echo "5. 清理本脚本添加的 Docker 出网规则"
   echo "0. 返回"
   read -r -p "请选择: " c
-
   case "$c" in
     1)
       docker_egress_clear_managed_rules
       if [[ -n "$subnets" ]]; then
         while read -r net; do
           [[ -z "$net" ]] && continue
-          iptables -I DOCKER-USER 1 -s "$net" -p tcp -m conntrack --ctstate NEW -m multiport --dports 80,443 \
-            -m comment --comment VPSMGR_DOCKER_EGRESS -j ACCEPT
-          iptables -I DOCKER-USER 2 -s "$net" -m conntrack --ctstate NEW \
-            -m comment --comment VPSMGR_DOCKER_EGRESS -j DROP
+          iptables -I DOCKER-USER 1 -s "$net" -p tcp -m conntrack --ctstate NEW -m multiport --dports 80,443 -m comment --comment VPSMGR_DOCKER_EGRESS -j ACCEPT
+          iptables -I DOCKER-USER 2 -s "$net" -m conntrack --ctstate NEW -m comment --comment VPSMGR_DOCKER_EGRESS -j DROP
         done <<< "$subnets"
         info "已设置：所有 Docker 子网仅允许 80/443 发起 NEW 出网，其它 NEW 丢弃。"
-      else
-        warn "未检测到子网，请用选项 3 自定义子网。"
-      fi
-      save_iptables_rules || true
-      ;;
+      else warn "未检测到子网，请用选项 3 自定义子网。"; fi
+      save_iptables_rules || true ;;
     2)
       docker_egress_clear_managed_rules
       if [[ -n "$subnets" ]]; then
-        while read -r net; do
-          [[ -z "$net" ]] && continue
-          iptables -I DOCKER-USER 1 -s "$net" -m conntrack --ctstate NEW \
-            -m comment --comment VPSMGR_DOCKER_EGRESS -j DROP
-        done <<< "$subnets"
+        while read -r net; do [[ -z "$net" ]] && continue; iptables -I DOCKER-USER 1 -s "$net" -m conntrack --ctstate NEW -m comment --comment VPSMGR_DOCKER_EGRESS -j DROP; done <<< "$subnets"
         info "已设置：所有 Docker 子网禁止发起 NEW 出网。"
-      else
-        warn "未检测到子网，请用选项 3 自定义子网。"
-      fi
-      save_iptables_rules || true
-      ;;
+      else warn "未检测到子网，请用选项 3 自定义子网。"; fi
+      save_iptables_rules || true ;;
     3)
       read -r -p "输入要限制/放行的子网（例如 172.30.0.0/16）： " net
       [[ -z "$net" ]] && { warn "未输入子网，取消。"; return 1; }
-
       echo "对该子网应用："
       echo "  a) 仅允许 80/443 NEW 出网"
       echo "  b) 禁止 NEW 出网"
       read -r -p "请选择(a/b): " m
-
       docker_egress_clear_managed_rules
-
       if [[ "$m" == "a" ]]; then
-        iptables -I DOCKER-USER 1 -s "$net" -p tcp -m conntrack --ctstate NEW -m multiport --dports 80,443 \
-          -m comment --comment VPSMGR_DOCKER_EGRESS -j ACCEPT
-        iptables -I DOCKER-USER 2 -s "$net" -m conntrack --ctstate NEW \
-          -m comment --comment VPSMGR_DOCKER_EGRESS -j DROP
+        iptables -I DOCKER-USER 1 -s "$net" -p tcp -m conntrack --ctstate NEW -m multiport --dports 80,443 -m comment --comment VPSMGR_DOCKER_EGRESS -j ACCEPT
+        iptables -I DOCKER-USER 2 -s "$net" -m conntrack --ctstate NEW -m comment --comment VPSMGR_DOCKER_EGRESS -j DROP
         info "已设置：$net 仅允许 80/443 NEW 出网，其它 NEW 丢弃。"
       elif [[ "$m" == "b" ]]; then
-        iptables -I DOCKER-USER 1 -s "$net" -m conntrack --ctstate NEW \
-          -m comment --comment VPSMGR_DOCKER_EGRESS -j DROP
+        iptables -I DOCKER-USER 1 -s "$net" -m conntrack --ctstate NEW -m comment --comment VPSMGR_DOCKER_EGRESS -j DROP
         info "已设置：$net 禁止 NEW 出网。"
-      else
-        warn "无效选择"
-        return 1
-      fi
-
-      save_iptables_rules || true
-      ;;
+      else warn "无效选择"; return 1; fi
+      save_iptables_rules || true ;;
     4) iptables -L DOCKER-USER -n -v --line-numbers ;;
     5) docker_egress_clear_managed_rules; save_iptables_rules || true ;;
     0) return ;;
@@ -1466,8 +1426,7 @@ docker_security_menu() {
 install_caddy_security() {
   echo -e "${BLUE}--- 生成 Caddy 防扫描规则片段 ---${NC}"
   mkdir -p /etc/caddy/snippets
-
-  cat >/etc/caddy/snippets/security.caddy <<'EOF'
+  cat >/etc/caddy/snippets/security.caddy <<'EOCADDY'
 (common_security) {
     @bad_ua {
         header_regexp User-Agent (?i)(nmap|masscan|zgrab|sqlmap|nikto|gobuster|dirbuster|curl|wget|python|go-http-client)
@@ -1498,8 +1457,7 @@ install_caddy_security() {
         window 10s
     }
 }
-EOF
-
+EOCADDY
   info "已写入：/etc/caddy/snippets/security.caddy"
   warn "在站点块中使用："
   echo "  import /etc/caddy/snippets/security.caddy"
@@ -1511,12 +1469,8 @@ harden_sysctl() {
   echo -e "${BLUE}--- sysctl 网络安全加固 ---${NC}"
   local marker_begin="# ---- v3.1.0 security hardening BEGIN ----"
   local marker_end="# ---- v3.1.0 security hardening END ----"
-
-  if grep -qF "$marker_begin" "$SYSCTL_CONFIG" 2>/dev/null; then
-    sed -i "/$marker_begin/,/$marker_end/d" "$SYSCTL_CONFIG"
-  fi
-
-  cat >>"$SYSCTL_CONFIG" <<EOF
+  if grep -qF "$marker_begin" "$SYSCTL_CONFIG" 2>/dev/null; then sed -i "/$marker_begin/,/$marker_end/d" "$SYSCTL_CONFIG"; fi
+  cat >>"$SYSCTL_CONFIG" <<EOSYSCTL
 
 $marker_begin
 net.ipv4.tcp_syncookies = 1
@@ -1530,8 +1484,7 @@ net.ipv4.conf.default.send_redirects = 0
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 $marker_end
-EOF
-
+EOSYSCTL
   sysctl -p "$SYSCTL_CONFIG" >/dev/null 2>&1 || true
   info "sysctl 加固已应用。"
 }
@@ -1540,27 +1493,19 @@ quick_malware_check() {
   echo -e "${BLUE}--- 快速恶意进程检查 ---${NC}"
   local out
   out=$(ps aux | egrep -i "scanner|masscan|nmap|zmap|check -f|\.\/scanner|\.\/check|socks5|pass\.txt|ok\.list" | grep -v grep || true)
-  if [[ -n "$out" ]]; then
-    echo -e "${RED}发现可疑进程（仅供线索，建议进一步排查）：${NC}"
-    echo "$out"
-  else
-    info "未发现明显恶意进程特征。"
-  fi
+  if [[ -n "$out" ]]; then echo -e "${RED}发现可疑进程（仅供线索，建议进一步排查）：${NC}"; echo "$out"; else info "未发现明显恶意进程特征。"; fi
 }
 
-# ------------------ 一键安全初始化（已修改：SSH 步骤改为调用 ssh_baseline_init） ------------------
 security_init_full() {
-  echo -e "${BLUE}=== 一键安全初始化（v3.1.3-TOOLBOX-FINAL）===${NC}"
+  echo -e "${BLUE}=== 一键安全初始化（v3.1.4-TOOLBOX-FINAL）===${NC}"
   echo -e "${YELLOW}将执行：一键 SSH 基线 + iptables 初始化 + Fail2Ban + sysctl 加固 + Docker 出网策略 + Caddy 防扫描${NC}"
   confirm "确认继续？" || { echo "操作已取消。"; return; }
-
   ssh_baseline_init || return 1
   enable_iptables || true
   install_fail2ban || true
   harden_sysctl || true
   docker_security_menu || true
   install_caddy_security || true
-
   info "一键安全初始化完成。"
 }
 
@@ -1574,10 +1519,9 @@ main() {
   while true; do
     local firewall_type
     firewall_type="$(detect_firewall)"
-
     clear
     echo "=============================================="
-    echo " VPS 高级管理脚本 v3.1.3-TOOLBOX-FINAL (分离版)"
+    echo " VPS 高级管理脚本 v3.1.4-TOOLBOX-FINAL (分离版)"
     echo "=============================================="
     echo " 1. 用户管理（账号：新增/删/改密码/sudo）"
     echo " 2. SSH 认证策略管理（仅密钥/密码/SFTP-only/多密钥/GitHub）"
@@ -1586,7 +1530,7 @@ main() {
     echo " 4. 一键 SSH 基线安全初始化（禁root/禁密码/端口${BASELINE_SSH_PORT}/${BASELINE_USER}）"
     echo "----------------------------------------------"
     echo " 5. 启用并初始化 iptables 防火墙（保守/强制）"
-    echo " 6. 配置防火墙端口 (当前: $firewall_type)"
+    echo " 6. 配置防火墙端口（支持多个端口/端口段，例如 60001,60010-60020）(当前: $firewall_type)"
     echo " 7. 查看当前防火墙规则 (当前: $firewall_type)"
     echo " 8. 端口转发管理 (iptables)"
     echo "----------------------------------------------"
@@ -1606,12 +1550,7 @@ main() {
       3) change_ssh_port ;;
       4) ssh_baseline_init ;;
       5)
-        if confirm "将配置 iptables（默认保守模式，不清空现有规则）。继续吗？"; then
-          enable_iptables
-        else
-          echo "操作已取消。"
-        fi
-        ;;
+        if confirm "将配置 iptables（默认保守模式，不清空现有规则）。继续吗？"; then enable_iptables; else echo "操作已取消。"; fi ;;
       6) configure_ports ;;
       7) show_firewall_rules ;;
       8) port_forwarding_menu ;;
